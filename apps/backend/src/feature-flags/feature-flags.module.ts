@@ -1,9 +1,8 @@
 import { Module } from '@nestjs/common';
+import { FeatureFlagsService } from './feature-flags.service';
 
 @Module({
-  imports: [],
-  controllers: [],
-  providers: [],
-  exports: [],
+  providers: [FeatureFlagsService],
+  exports: [FeatureFlagsService],
 })
 export class FeatureFlagsModule {}
