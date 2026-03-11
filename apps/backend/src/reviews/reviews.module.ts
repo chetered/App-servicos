@@ -1,9 +1,10 @@
 import { Module } from '@nestjs/common';
+import { ReviewsController } from './reviews.controller';
+import { ReviewsService } from './reviews.service';
 
 @Module({
-  imports: [],
-  controllers: [],
-  providers: [],
-  exports: [],
+  controllers: [ReviewsController],
+  providers: [ReviewsService],
+  exports: [ReviewsService],
 })
 export class ReviewsModule {}
