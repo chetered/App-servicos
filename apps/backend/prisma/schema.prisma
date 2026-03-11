@@ -1,0 +1,1177 @@
+// SERVIX — Prisma Schema
+// Marketplace de Serviços Sob Demanda
+// v1.0 — Multi-country, Multi-currency, Recurrence-ready
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+// ============================================================
+// ENUMS
+// ============================================================
+
+enum UserRole {
+  CLIENT
+  PROVIDER
+  ADMIN
+  SUPPORT
+}
+
+enum AuthProvider {
+  EMAIL
+  PHONE
+  GOOGLE
+  APPLE
+}
+
+enum ProviderStatus {
+  PENDING_REVIEW
+  UNDER_REVIEW
+  ACTIVE
+  SUSPENDED
+  REJECTED
+}
+
+enum VerificationStatus {
+  PENDING
+  APPROVED
+  REJECTED
+  EXPIRED
+}
+
+enum BookingType {
+  IMMEDIATE
+  SCHEDULED
+  RECURRING
+}
+
+enum BookingStatus {
+  PENDING_PAYMENT
+  PAID
+  ACCEPTED
+  SCHEDULED
+  IN_TRANSIT
+  IN_PROGRESS
+  COMPLETED
+  CANCELLED_BY_CLIENT
+  CANCELLED_BY_PROVIDER
+  IN_DISPUTE
+  REFUNDED
+}
+
+enum RecurrenceFrequency {
+  WEEKLY
+  BIWEEKLY
+  MONTHLY
+}
+
+enum RecurrenceStatus {
+  ACTIVE
+  PAUSED
+  CANCELLED
+  COMPLETED
+}
+
+enum PaymentStatus {
+  PENDING
+  SUCCEEDED
+  FAILED
+  REFUNDED
+  PARTIALLY_REFUNDED
+  CANCELLED
+}
+
+enum PaymentMethodType {
+  CARD
+  PIX
+  WALLET
+  BOLETO
+  OTHER
+}
+
+enum DisplacementType {
+  NONE
+  FIXED
+  BY_DISTANCE_RANGE
+  BY_ZONE
+  INCLUDED
+}
+
+enum CommissionType {
+  PERCENTAGE
+  FIXED
+  MIXED
+}
+
+enum PayoutStatus {
+  PENDING
+  PROCESSING
+  COMPLETED
+  FAILED
+}
+
+enum SupportTicketStatus {
+  OPEN
+  IN_PROGRESS
+  AWAITING_CLIENT
+  AWAITING_PROVIDER
+  RESOLVED
+  CLOSED
+}
+
+enum DisputeStatus {
+  OPEN
+  INVESTIGATING
+  DECIDED_FOR_CLIENT
+  DECIDED_FOR_PROVIDER
+  ESCALATED
+  CLOSED
+}
+
+enum MonetizationSource {
+  COMMISSION
+  CONVENIENCE_FEE
+  URGENCY_FEE
+  DISPLACEMENT_FEE
+  SPONSORED_SLOT
+  PREMIUM_SUBSCRIPTION
+  INSURANCE_FEE
+  CORPORATE_PLAN
+  COUPON_CASHBACK
+}
+
+enum CouponDiscountType {
+  PERCENTAGE
+  FIXED_AMOUNT
+}
+
+enum FeatureFlagStatus {
+  ENABLED
+  DISABLED
+  ROLLOUT // partial rollout
+}
+
+// ============================================================
+// USERS & AUTH
+// ============================================================
+
+model User {
+  id                String       @id @default(uuid())
+  email             String?      @unique
+  phone             String?      @unique
+  passwordHash      String?
+  fullName          String?
+  avatarUrl         String?
+  roles             UserRole[]   @default([CLIENT])
+  authProvider      AuthProvider @default(EMAIL)
+  googleId          String?      @unique
+  appleId           String?      @unique
+
+  // Verification
+  isEmailVerified   Boolean      @default(false)
+  isPhoneVerified   Boolean      @default(false)
+  isBanned          Boolean      @default(false)
+  banReason         String?
+
+  // Gateway
+  gatewayCustomerId String?      // Stripe/MP customer ID
+
+  // Timestamps
+  lastLoginAt       DateTime?
+  createdAt         DateTime     @default(now())
+  updatedAt         DateTime     @updatedAt
+
+  // Relations
+  profile           UserProfile?
+  provider          Provider?
+  addresses         Address[]
+  paymentMethods    PaymentMethod[]
+  clientOrders      ServiceOrder[]       @relation("ClientOrders")
+  refreshTokens     RefreshToken[]
+  emailVerifications EmailVerificationToken[]
+  sentReviews       Review[]             @relation("ReviewAuthor")
+  receivedReviews   Review[]             @relation("ReviewTarget")
+  supportTickets    SupportTicket[]      @relation("TicketReporter")
+  notifications     Notification[]
+  auditLogs         AuditLog[]
+  analyticsEvents   AnalyticsEvent[]
+
+  @@index([email])
+  @@index([phone])
+  @@index([googleId])
+  @@map("users")
+}
+
+model UserProfile {
+  id          String   @id @default(uuid())
+  userId      String   @unique
+  displayName String?
+  bio         String?  @db.VarChar(500)
+  preferredLanguage String @default("pt-BR")
+  preferredCountryId String?
+  favoriteProviders String[] // Array of provider IDs
+
+  createdAt   DateTime @default(now())
+  updatedAt   DateTime @updatedAt
+
+  user        User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+  country     Country? @relation(fields: [preferredCountryId], references: [id])
+
+  @@map("user_profiles")
+}
+
+model RefreshToken {
+  id        String   @id @default(uuid())
+  token     String   @unique
+  userId    String
+  isRevoked Boolean  @default(false)
+  expiresAt DateTime
+  createdAt DateTime @default(now())
+
+  user      User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([token])
+  @@index([userId])
+  @@map("refresh_tokens")
+}
+
+model EmailVerificationToken {
+  id        String   @id @default(uuid())
+  token     String   @unique
+  userId    String
+  email     String
+  isUsed    Boolean  @default(false)
+  expiresAt DateTime
+  createdAt DateTime @default(now())
+
+  user      User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@map("email_verification_tokens")
+}
+
+// ============================================================
+// PROVIDERS
+// ============================================================
+
+model Provider {
+  id                  String         @id @default(uuid())
+  userId              String         @unique
+  status              ProviderStatus @default(PENDING_REVIEW)
+  bio                 String?        @db.VarChar(1000)
+  yearsOfExperience   Int?
+  averageRating       Float?         @default(0)
+  totalReviews        Int            @default(0)
+  totalCompletedJobs  Int            @default(0)
+  acceptanceRate      Float?
+  completionRate      Float?
+  responseTimeMinutes Int?           // Average response time
+
+  // Location
+  currentLatitude     Float?
+  currentLongitude    Float?
+  serviceRadiusKm     Float?         @default(15)
+  isAvailableNow      Boolean        @default(false)
+
+  // Ranking
+  rankingScore        Float?         @default(0)
+  isFeatured          Boolean        @default(false)
+  isPremium           Boolean        @default(false)
+
+  // Financial
+  bankAccountInfo     Json?          // Encrypted bank details
+  pixKey              String?
+  totalEarnings       Float          @default(0)
+  pendingPayout       Float          @default(0)
+
+  // Review
+  reviewedAt          DateTime?
+  reviewedBy          String?
+  reviewNotes         String?
+
+  createdAt           DateTime       @default(now())
+  updatedAt           DateTime       @updatedAt
+
+  user                User           @relation(fields: [userId], references: [id])
+  documents           ProviderDocument[]
+  verification        ProviderVerification?
+  services            ProviderService[]
+  pricingRules        ProviderPricingRule[]
+  availability        ProviderAvailability[]
+  zones               ProviderZone[]
+  displacementRule    DisplacementRule?
+  orders              ServiceOrder[]       @relation("ProviderOrders")
+  payouts             Payout[]
+  sponsoredSlots      SponsoredSlot[]
+  premiumSubscription PremiumSubscription?
+  rankingHistory      ProviderRankingScore[]
+
+  @@index([status])
+  @@index([rankingScore])
+  @@index([currentLatitude, currentLongitude])
+  @@map("providers")
+}
+
+model ProviderDocument {
+  id          String             @id @default(uuid())
+  providerId  String
+  type        String             // CPF, RG, CNH, CREA, CRN, etc.
+  status      VerificationStatus @default(PENDING)
+  fileUrl     String
+  fileKey     String             // S3 key (never expose)
+  expiresAt   DateTime?
+  reviewedAt  DateTime?
+  reviewNotes String?
+
+  createdAt   DateTime           @default(now())
+
+  provider    Provider           @relation(fields: [providerId], references: [id], onDelete: Cascade)
+
+  @@map("provider_documents")
+}
+
+model ProviderVerification {
+  id              String             @id @default(uuid())
+  providerId      String             @unique
+  status          VerificationStatus @default(PENDING)
+  selfieUrl       String?
+  identityScore   Float?             // From AI/manual review
+  checklist       Json?              // What was verified
+  verifiedAt      DateTime?
+  verifiedBy      String?
+  rejectionReason String?
+
+  provider        Provider           @relation(fields: [providerId], references: [id], onDelete: Cascade)
+
+  @@map("provider_verifications")
+}
+
+model ProviderService {
+  id          String   @id @default(uuid())
+  providerId  String
+  serviceId   String
+  isActive    Boolean  @default(true)
+  createdAt   DateTime @default(now())
+
+  provider    Provider @relation(fields: [providerId], references: [id], onDelete: Cascade)
+  service     Service  @relation(fields: [serviceId], references: [id])
+
+  @@unique([providerId, serviceId])
+  @@map("provider_services")
+}
+
+model ProviderPricingRule {
+  id           String   @id @default(uuid())
+  providerId   String
+  serviceId    String
+  basePrice    Float    // In cents
+  minPrice     Float?
+  maxPrice     Float?
+  customFields Json?    // Variable pricing (per m², per hour, etc.)
+  isActive     Boolean  @default(true)
+
+  provider     Provider @relation(fields: [providerId], references: [id], onDelete: Cascade)
+  service      Service  @relation(fields: [serviceId], references: [id])
+
+  @@unique([providerId, serviceId])
+  @@map("provider_pricing_rules")
+}
+
+model ProviderAvailability {
+  id          String   @id @default(uuid())
+  providerId  String
+  dayOfWeek   Int      // 0=Sunday, 6=Saturday
+  startTime   String   // HH:mm
+  endTime     String   // HH:mm
+  isActive    Boolean  @default(true)
+  bufferMinutes Int    @default(30)
+
+  provider    Provider @relation(fields: [providerId], references: [id], onDelete: Cascade)
+
+  @@index([providerId, dayOfWeek])
+  @@map("provider_availability")
+}
+
+model ProviderZone {
+  id         String   @id @default(uuid())
+  providerId String
+  cityId     String?
+  bairro     String?
+  postalCode String?
+  polygon    Json?    // GeoJSON polygon for coverage area
+
+  provider   Provider @relation(fields: [providerId], references: [id], onDelete: Cascade)
+
+  @@map("provider_zones")
+}
+
+model DisplacementRule {
+  id              String           @id @default(uuid())
+  providerId      String           @unique
+  type            DisplacementType @default(NONE)
+  fixedAmount     Float?
+  showSeparately  Boolean          @default(true)
+  distanceRanges  Json?            // [{minKm, maxKm, price}]
+  zoneRules       Json?            // [{zone, price}]
+
+  provider        Provider         @relation(fields: [providerId], references: [id], onDelete: Cascade)
+
+  @@map("displacement_rules")
+}
+
+model ProviderRankingScore {
+  id                  String   @id @default(uuid())
+  providerId          String
+  score               Float
+  ratingScore         Float
+  acceptanceScore     Float
+  completionScore     Float
+  responseScore       Float
+  recurrenceScore     Float
+  reliabilityScore    Float
+  calculatedAt        DateTime @default(now())
+
+  provider            Provider @relation(fields: [providerId], references: [id])
+
+  @@index([providerId, calculatedAt])
+  @@map("provider_ranking_scores")
+}
+
+// ============================================================
+// CATEGORIES & SERVICES
+// ============================================================
+
+model ServiceCategory {
+  id           String    @id @default(uuid())
+  slug         String    @unique
+  name         Json      // Translatable: {"pt-BR": "Diarista", "en-US": "Cleaner"}
+  description  Json?
+  iconUrl      String?
+  color        String?   // Hex color
+  isActive     Boolean   @default(true)
+  sortOrder    Int       @default(0)
+  parentId     String?   // For subcategories
+
+  parent       ServiceCategory?  @relation("CategoryHierarchy", fields: [parentId], references: [id])
+  children     ServiceCategory[] @relation("CategoryHierarchy")
+  services     Service[]
+  countryCategories CountryCategory[]
+
+  createdAt    DateTime  @default(now())
+  updatedAt    DateTime  @updatedAt
+
+  @@index([slug])
+  @@map("service_categories")
+}
+
+model Service {
+  id              String   @id @default(uuid())
+  categoryId      String
+  slug            String   @unique
+  name            Json     // Translatable
+  description     Json?
+  defaultPrice    Float    // Suggested base price
+  customFields    Json?    // Schema for custom inputs per service
+  requirements    Json?    // Required documents/certifications
+  isActive        Boolean  @default(true)
+
+  createdAt       DateTime @default(now())
+  updatedAt       DateTime @updatedAt
+
+  category        ServiceCategory @relation(fields: [categoryId], references: [id])
+  providerServices ProviderService[]
+  pricingRules    ProviderPricingRule[]
+  orders          ServiceOrder[]
+  commissionRules CommissionRule[]
+
+  @@index([categoryId])
+  @@index([slug])
+  @@map("services")
+}
+
+// ============================================================
+// BOOKINGS & ORDERS
+// ============================================================
+
+model ServiceOrder {
+  id              String        @id @default(uuid())
+  clientId        String
+  providerId      String
+  serviceId       String
+  bookingType     BookingType
+  status          BookingStatus @default(PENDING_PAYMENT)
+  scheduledAt     DateTime?
+  startedAt       DateTime?
+  completedAt     DateTime?
+  notes           String?
+  customFields    Json?
+
+  // Address snapshot
+  addressId       String
+
+  // Price snapshot (immutable after creation)
+  servicePrice    Float
+  displacementFee Float         @default(0)
+  urgencyFee      Float         @default(0)
+  platformFee     Float
+  couponDiscount  Float         @default(0)
+  insuranceFee    Float         @default(0)
+  totalAmount     Float
+  currency        String        @default("BRL")
+  priceBreakdown  Json?         // Full breakdown for display
+
+  // Idempotency
+  idempotencyKey  String        @unique
+
+  // Recurring
+  recurringPlanId String?
+
+  createdAt       DateTime      @default(now())
+  updatedAt       DateTime      @updatedAt
+
+  client          User          @relation("ClientOrders", fields: [clientId], references: [id])
+  provider        Provider      @relation("ProviderOrders", fields: [providerId], references: [id])
+  service         Service       @relation(fields: [serviceId], references: [id])
+  address         Address       @relation(fields: [addressId], references: [id])
+  recurringPlan   RecurringServicePlan? @relation(fields: [recurringPlanId], references: [id])
+  statusHistory   OrderStatusHistory[]
+  payments        Payment[]
+  review          Review?
+  ticket          SupportTicket?
+  dispute         Dispute?
+  paymentSplit    PaymentSplit?
+  monetizationEntries MonetizationLedger[]
+
+  @@index([clientId, status])
+  @@index([providerId, status])
+  @@index([scheduledAt])
+  @@index([createdAt])
+  @@map("service_orders")
+}
+
+model OrderStatusHistory {
+  id         String        @id @default(uuid())
+  orderId    String
+  status     BookingStatus
+  actorId    String?
+  actorType  String?       // CLIENT, PROVIDER, SYSTEM, ADMIN
+  metadata   Json?
+  createdAt  DateTime      @default(now())
+
+  order      ServiceOrder  @relation(fields: [orderId], references: [id], onDelete: Cascade)
+
+  @@index([orderId, createdAt])
+  @@map("order_status_history")
+}
+
+// ============================================================
+// RECURRENCE
+// ============================================================
+
+model RecurringServicePlan {
+  id                  String              @id @default(uuid())
+  clientId            String
+  providerId          String?             // Preferred provider (can change)
+  serviceId           String
+  frequency           RecurrenceFrequency
+  status              RecurrenceStatus    @default(ACTIVE)
+  preferredDayOfWeek  Int?               // 0-6
+  preferredTime       String?            // HH:mm
+  totalOccurrences    Int?               // null = indefinite
+  completedOccurrences Int               @default(0)
+  nextScheduledAt     DateTime?
+  pausedAt            DateTime?
+  cancelledAt         DateTime?
+  cancelReason        String?
+
+  createdAt           DateTime            @default(now())
+  updatedAt           DateTime            @updatedAt
+
+  executions          ServiceOrder[]
+  paymentSchedules    PaymentSchedule[]
+
+  @@index([clientId, status])
+  @@map("recurring_service_plans")
+}
+
+model PaymentSchedule {
+  id              String   @id @default(uuid())
+  planId          String
+  scheduledFor    DateTime
+  status          String   @default("PENDING") // PENDING, PROCESSED, SKIPPED, FAILED
+  amount          Float?
+  processedAt     DateTime?
+  orderId         String?
+
+  plan            RecurringServicePlan @relation(fields: [planId], references: [id])
+
+  @@index([planId, status])
+  @@index([scheduledFor])
+  @@map("payment_schedules")
+}
+
+// ============================================================
+// PAYMENTS & FINANCIAL
+// ============================================================
+
+model PaymentMethod {
+  id                      String            @id @default(uuid())
+  userId                  String
+  type                    PaymentMethodType
+  last4                   String?
+  brand                   String?
+  expiryMonth             Int?
+  expiryYear              Int?
+  gatewayPaymentMethodId  String?
+  gatewayName             String?
+  isDefault               Boolean           @default(false)
+  isActive                Boolean           @default(true)
+
+  createdAt               DateTime          @default(now())
+
+  user                    User              @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([userId])
+  @@map("payment_methods")
+}
+
+model Payment {
+  id                    String        @id @default(uuid())
+  orderId               String
+  amount                Float         // In cents
+  currency              String        @default("BRL")
+  status                PaymentStatus @default(PENDING)
+  gatewayName           String?
+  gatewayTransactionId  String?       @unique
+  paymentMethodId       String?
+  idempotencyKey        String        @unique
+  errorMessage          String?
+  processedAt           DateTime?
+  metadata              Json?
+
+  createdAt             DateTime      @default(now())
+  updatedAt             DateTime      @updatedAt
+
+  order                 ServiceOrder  @relation(fields: [orderId], references: [id])
+  refunds               Refund[]
+  split                 PaymentSplit?
+
+  @@index([orderId])
+  @@index([gatewayTransactionId])
+  @@index([status])
+  @@map("payments")
+}
+
+model Refund {
+  id              String   @id @default(uuid())
+  paymentId       String
+  amount          Float
+  status          String   @default("PENDING")
+  gatewayRefundId String?
+  reason          String?
+  idempotencyKey  String   @unique
+  processedAt     DateTime?
+
+  createdAt       DateTime @default(now())
+
+  payment         Payment  @relation(fields: [paymentId], references: [id])
+
+  @@map("refunds")
+}
+
+model PaymentSplit {
+  id              String   @id @default(uuid())
+  orderId         String   @unique
+  paymentId       String   @unique
+  totalAmount     Float
+  platformAmount  Float    // Commission kept
+  providerAmount  Float    // Net to provider
+  currency        String   @default("BRL")
+  commissionRate  Float    // Snapshot of rate used
+  isSettled       Boolean  @default(false)
+  settledAt       DateTime?
+
+  order           ServiceOrder @relation(fields: [orderId], references: [id])
+  payment         Payment      @relation(fields: [paymentId], references: [id])
+
+  @@map("payment_splits")
+}
+
+model Payout {
+  id          String      @id @default(uuid())
+  providerId  String
+  amount      Float
+  currency    String      @default("BRL")
+  status      PayoutStatus @default(PENDING)
+  method      String      // PIX, bank_transfer
+  destination String?     // PIX key or bank account (masked)
+  reference   String?     // Gateway reference
+  scheduledFor DateTime?
+  processedAt DateTime?
+  failureReason String?
+
+  createdAt   DateTime    @default(now())
+
+  provider    Provider    @relation(fields: [providerId], references: [id])
+
+  @@index([providerId, status])
+  @@map("payouts")
+}
+
+model CommissionRule {
+  id           String         @id @default(uuid())
+  name         String
+  type         CommissionType @default(PERCENTAGE)
+  percentage   Float?         // e.g., 20.0
+  fixedAmount  Float?         // Fixed fee in cents
+  serviceId    String?
+  categoryId   String?
+  countryId    String?
+  priority     Int            @default(0)   // Higher = evaluated first
+  isDefault    Boolean        @default(false)
+  isActive     Boolean        @default(true)
+  validFrom    DateTime?
+  validUntil   DateTime?
+
+  service      Service?       @relation(fields: [serviceId], references: [id])
+  country      Country?       @relation(fields: [countryId], references: [id])
+
+  @@index([isActive, priority])
+  @@map("commission_rules")
+}
+
+model MonetizationLedger {
+  id          String             @id @default(uuid())
+  orderId     String
+  source      MonetizationSource
+  amount      Float
+  currency    String             @default("BRL")
+  metadata    Json?
+  recordedAt  DateTime           @default(now())
+
+  order       ServiceOrder       @relation(fields: [orderId], references: [id])
+
+  @@index([orderId])
+  @@index([source, recordedAt])
+  @@map("monetization_ledger")
+}
+
+// ============================================================
+// ADDRESSES
+// ============================================================
+
+model Address {
+  id           String   @id @default(uuid())
+  userId       String
+  label        String?  // "Casa", "Trabalho", etc.
+  street       String
+  number       String
+  complement   String?
+  neighborhood String
+  city         String
+  state        String
+  postalCode   String
+  countryCode  String   @default("BR")
+  latitude     Float
+  longitude    Float
+  isDefault    Boolean  @default(false)
+  isSnapshot   Boolean  @default(false) // True = address at time of order
+
+  createdAt    DateTime @default(now())
+
+  user         User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+  orders       ServiceOrder[]
+
+  @@index([userId])
+  @@index([latitude, longitude])
+  @@map("addresses")
+}
+
+// ============================================================
+// REVIEWS & TRUST
+// ============================================================
+
+model Review {
+  id           String   @id @default(uuid())
+  orderId      String   @unique
+  authorId     String   // Who wrote it
+  targetId     String   // Who is being reviewed
+  rating       Int      // 1-5
+  comment      String?  @db.VarChar(1000)
+  photos       String[] // URLs
+  isPublished  Boolean  @default(false)
+  isFlagged    Boolean  @default(false)
+  flagReason   String?
+  publishedAt  DateTime?
+  moderatedAt  DateTime?
+  moderatedBy  String?
+  providerReply String? @db.VarChar(500)
+
+  createdAt    DateTime @default(now())
+  updatedAt    DateTime @updatedAt
+
+  order        ServiceOrder @relation(fields: [orderId], references: [id])
+  author       User         @relation("ReviewAuthor", fields: [authorId], references: [id])
+  target       User         @relation("ReviewTarget", fields: [targetId], references: [id])
+
+  @@index([targetId, isPublished])
+  @@index([orderId])
+  @@map("reviews")
+}
+
+model TrustScore {
+  id               String   @id @default(uuid())
+  userId           String   @unique
+  overallScore     Float    @default(0)
+  identityScore    Float    @default(0)  // Document verification
+  behaviorScore    Float    @default(0)  // No fraud/disputes
+  ratingScore      Float    @default(0)  // Average rating
+  completionScore  Float    @default(0)  // Completion rate
+  recalculatedAt   DateTime @default(now())
+
+  @@map("trust_scores")
+}
+
+// ============================================================
+// SUPPORT & DISPUTES
+// ============================================================
+
+model SupportTicket {
+  id          String              @id @default(uuid())
+  orderId     String?             @unique
+  reporterId  String
+  category    String              // CANCELLATION, QUALITY, PAYMENT, OTHER
+  subject     String
+  description String              @db.VarChar(2000)
+  status      SupportTicketStatus @default(OPEN)
+  priority    String              @default("NORMAL") // LOW, NORMAL, HIGH, CRITICAL
+  assignedTo  String?
+  resolvedAt  DateTime?
+  resolutionNote String?
+  attachments String[]
+
+  createdAt   DateTime            @default(now())
+  updatedAt   DateTime            @updatedAt
+
+  order       ServiceOrder?       @relation(fields: [orderId], references: [id])
+  reporter    User                @relation("TicketReporter", fields: [reporterId], references: [id])
+  messages    TicketMessage[]
+  dispute     Dispute?
+
+  @@index([status, priority])
+  @@index([reporterId])
+  @@map("support_tickets")
+}
+
+model TicketMessage {
+  id        String   @id @default(uuid())
+  ticketId  String
+  authorId  String
+  authorType String  // CLIENT, PROVIDER, SUPPORT, SYSTEM
+  message   String   @db.VarChar(2000)
+  attachments String[]
+
+  createdAt DateTime @default(now())
+
+  ticket    SupportTicket @relation(fields: [ticketId], references: [id], onDelete: Cascade)
+
+  @@index([ticketId, createdAt])
+  @@map("ticket_messages")
+}
+
+model Dispute {
+  id          String        @id @default(uuid())
+  orderId     String        @unique
+  ticketId    String?       @unique
+  status      DisputeStatus @default(OPEN)
+  reason      String
+  description String?       @db.VarChar(2000)
+  evidence    Json?         // Photos, screenshots, etc.
+  decidedFor  String?       // CLIENT or PROVIDER
+  decisionNote String?
+  decidedAt   DateTime?
+  decidedBy   String?
+
+  createdAt   DateTime      @default(now())
+  updatedAt   DateTime      @updatedAt
+
+  order       ServiceOrder  @relation(fields: [orderId], references: [id])
+  ticket      SupportTicket? @relation(fields: [ticketId], references: [id])
+
+  @@map("disputes")
+}
+
+// ============================================================
+// COUPONS & PROMOTIONS
+// ============================================================
+
+model Coupon {
+  id              String             @id @default(uuid())
+  code            String             @unique
+  name            String
+  discountType    CouponDiscountType
+  discountValue   Float
+  minOrderValue   Float?
+  maxDiscount     Float?
+  countryId       String?
+  categoryId      String?
+  targetUserId    String?            // Specific user coupon
+  totalUsageLimit Int?               // Max total uses
+  perUserLimit    Int?               @default(1)
+  usedCount       Int                @default(0)
+  isActive        Boolean            @default(true)
+  expiresAt       DateTime?
+
+  createdAt       DateTime           @default(now())
+
+  usages          CouponUsage[]
+
+  @@index([code])
+  @@index([isActive, expiresAt])
+  @@map("coupons")
+}
+
+model CouponUsage {
+  id        String   @id @default(uuid())
+  couponId  String
+  userId    String
+  orderId   String
+  usedAt    DateTime @default(now())
+
+  coupon    Coupon   @relation(fields: [couponId], references: [id])
+
+  @@unique([couponId, userId])
+  @@map("coupon_usages")
+}
+
+// ============================================================
+// SPONSORED & PREMIUM
+// ============================================================
+
+model SponsoredSlot {
+  id          String   @id @default(uuid())
+  providerId  String
+  categoryId  String?
+  cityId      String?
+  boostFactor Float    @default(1.5) // Ranking multiplier
+  startDate   DateTime
+  endDate     DateTime
+  amountPaid  Float
+  isActive    Boolean  @default(true)
+  impressions Int      @default(0)
+  clicks      Int      @default(0)
+  conversions Int      @default(0)
+
+  createdAt   DateTime @default(now())
+
+  provider    Provider @relation(fields: [providerId], references: [id])
+
+  @@index([providerId, isActive])
+  @@index([endDate])
+  @@map("sponsored_slots")
+}
+
+model PremiumSubscription {
+  id              String   @id @default(uuid())
+  providerId      String   @unique
+  planName        String   // BASIC, PROFESSIONAL, ENTERPRISE
+  priceMonthly    Float
+  commissionRate  Float    // Discounted commission rate
+  features        Json     // List of enabled features
+  status          String   @default("ACTIVE") // ACTIVE, CANCELLED, EXPIRED
+  currentPeriodStart DateTime
+  currentPeriodEnd   DateTime
+  gatewaySubscriptionId String?
+
+  createdAt       DateTime @default(now())
+
+  provider        Provider @relation(fields: [providerId], references: [id])
+
+  @@map("premium_subscriptions")
+}
+
+// ============================================================
+// LOCALIZATION & COUNTRIES
+// ============================================================
+
+model Country {
+  id              String   @id @default(uuid())
+  code            String   @unique // ISO 3166-1 alpha-2 (BR, US, AR)
+  name            String
+  currencyCode    String   // ISO 4217 (BRL, USD, ARS)
+  currencySymbol  String
+  defaultLocale   String   @default("pt-BR")
+  timezone        String   @default("America/Sao_Paulo")
+  phonePrefix     String
+  addressFormat   Json?    // How to display addresses
+  isActive        Boolean  @default(false)
+  launchedAt      DateTime?
+
+  // Financial rules
+  defaultCommissionRate Float @default(20)
+  minPayout       Float    @default(0)
+  payoutSchedule  String   @default("D+1") // D+1, D+2, weekly
+
+  createdAt       DateTime @default(now())
+
+  categories      CountryCategory[]
+  gateways        PaymentGatewayConfig[]
+  commissionRules CommissionRule[]
+  taxRules        TaxRule[]
+  featureFlags    FeatureFlag[]
+  userProfiles    UserProfile[]
+
+  @@map("countries")
+}
+
+model CountryCategory {
+  id         String   @id @default(uuid())
+  countryId  String
+  categoryId String
+  isActive   Boolean  @default(true)
+
+  country    Country         @relation(fields: [countryId], references: [id])
+  category   ServiceCategory @relation(fields: [categoryId], references: [id])
+
+  @@unique([countryId, categoryId])
+  @@map("country_categories")
+}
+
+model PaymentGatewayConfig {
+  id          String   @id @default(uuid())
+  countryCode String
+  gatewayName String   // STRIPE, MERCADOPAGO, PAGSEGURO, etc.
+  isDefault   Boolean  @default(false)
+  isActive    Boolean  @default(true)
+  config      Json?    // Gateway-specific config (public keys, etc.)
+
+  country     Country  @relation(fields: [countryCode], references: [code])
+
+  @@unique([countryCode, gatewayName])
+  @@map("payment_gateway_configs")
+}
+
+model TaxRule {
+  id          String   @id @default(uuid())
+  countryId   String
+  name        String   // ISS, IVA, VAT, etc.
+  rate        Float    // Percentage
+  appliesTo   String   // SERVICE, PLATFORM_FEE, ALL
+  isActive    Boolean  @default(true)
+
+  country     Country  @relation(fields: [countryId], references: [id])
+
+  @@map("tax_rules")
+}
+
+model FeatureFlag {
+  id          String            @id @default(uuid())
+  key         String
+  status      FeatureFlagStatus @default(DISABLED)
+  countryId   String?
+  rolloutPercentage Float?      // For ROLLOUT status
+  description String?
+  metadata    Json?
+
+  country     Country?          @relation(fields: [countryId], references: [id])
+
+  @@unique([key, countryId])
+  @@index([key])
+  @@map("feature_flags")
+}
+
+// ============================================================
+// NOTIFICATIONS
+// ============================================================
+
+model Notification {
+  id          String   @id @default(uuid())
+  userId      String
+  type        String   // BOOKING_CONFIRMED, PAYMENT_RECEIVED, etc.
+  title       String
+  body        String
+  data        Json?
+  isRead      Boolean  @default(false)
+  readAt      DateTime?
+  channel     String   @default("PUSH") // PUSH, EMAIL, SMS
+
+  createdAt   DateTime @default(now())
+
+  user        User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([userId, isRead])
+  @@index([createdAt])
+  @@map("notifications")
+}
+
+// ============================================================
+// ANALYTICS
+// ============================================================
+
+model AnalyticsEvent {
+  id         String   @id @default(uuid())
+  type       String   // page_view, booking_created, checkout_started, etc.
+  actorId    String?
+  actorType  String?  // USER, PROVIDER, SYSTEM
+  entityType String?  // ORDER, PROVIDER, CATEGORY
+  entityId   String?
+  properties Json?
+  sessionId  String?
+  deviceType String?
+  appVersion String?
+  countryCode String?
+  city       String?
+  occurredAt DateTime @default(now())
+
+  actor      User?    @relation(fields: [actorId], references: [id])
+
+  @@index([type, occurredAt])
+  @@index([actorId, occurredAt])
+  @@index([entityType, entityId])
+  @@map("analytics_events")
+}
+
+// ============================================================
+// AUDIT
+// ============================================================
+
+model AuditLog {
+  id         String   @id @default(uuid())
+  actorId    String?
+  action     String   // user.banned, commission.changed, etc.
+  entityType String
+  entityId   String
+  oldValues  Json?
+  newValues  Json?
+  ipAddress  String?
+  userAgent  String?
+  createdAt  DateTime @default(now())
+
+  actor      User?    @relation(fields: [actorId], references: [id])
+
+  @@index([entityType, entityId])
+  @@index([actorId, createdAt])
+  @@index([createdAt])
+  @@map("audit_logs")
+}
+
+// ============================================================
+// SETTINGS
+// ============================================================
+
+model Setting {
+  id          String   @id @default(uuid())
+  key         String   @unique
+  value       String
+  description String?
+  isPublic    Boolean  @default(false)
+  updatedBy   String?
+
+  updatedAt   DateTime @updatedAt
+
+  @@map("settings")
+}
