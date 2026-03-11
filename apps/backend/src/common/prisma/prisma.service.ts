@@ -8,6 +8,7 @@ export class PrismaService extends PrismaClient implements OnModuleInit, OnModul
 
   constructor(private config: ConfigService) {
     super({
+      datasourceUrl: config.get<string>('DATABASE_URL'),
       log: [
         { emit: 'event', level: 'query' },
         { emit: 'event', level: 'error' },
