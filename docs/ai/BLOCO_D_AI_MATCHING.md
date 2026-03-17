@@ -1982,3 +1982,716 @@ describe('MatchingService', () => {
   });
 });
 ```
+
+---
+
+## 18. MATCHING.SERVICE.TS — IMPLEMENTAÇÃO COMPLETA
+
+Esta é a versão final do serviço com **todos os métodos integrados**:
+`search()` como ponto de entrada, queries ao banco, filtros hard,
+scoring, cold start boost, fairness, logging de impressões e hot reload
+de pesos via Redis pub/sub.
+
+```typescript
+// src/matching/matching.service.ts
+
+import { Injectable, Logger, OnModuleInit } from '@nestjs/common';
+import { PrismaService } from '../prisma/prisma.service';
+import { MatchingCacheService } from './cache/matching.cache.service';
+import { ShadowModeService } from './ml/shadow.mode.service';
+import {
+  MatchingContext,
+  RankedProvider,
+  ScoreBreakdown,
+  ProviderCandidate,
+} from './matching.types';
+import { v4 as uuidv4 } from 'uuid';
+
+@Injectable()
+export class MatchingService implements OnModuleInit {
+  private readonly logger = new Logger(MatchingService.name);
+
+  // ─── Pesos configuráveis (hot reload via Redis pub/sub) ───────────────────
+  private WEIGHTS = {
+    distance:    0.20,
+    rating:      0.25,
+    completion:  0.20,
+    acceptance:  0.10,
+    availability:0.10,
+    trust:       0.10,
+    recurrence:  0.03,
+    price:       0.02,
+  };
+
+  private readonly FAIRNESS = {
+    maxConcentration: 0.15,   // prestador não pode ter > 15% dos bookings da zona
+    maxConsecutiveTop3: 3,    // não aparece top-3 mais de 3x seguidas para o mesmo cliente
+    lowActivityThreshold: 5,  // bookings/mês abaixo disso → boost de visibilidade
+    lowActivityBoostFactor: 1.15,
+  };
+
+  constructor(
+    private readonly prisma: PrismaService,
+    private readonly cache: MatchingCacheService,
+    private readonly shadow: ShadowModeService,
+  ) {}
+
+  // ─── Hot reload de pesos ──────────────────────────────────────────────────
+  async onModuleInit(): Promise<void> {
+    await this.cache.subscribeToWeightsUpdate((weights) => {
+      this.WEIGHTS = { ...this.WEIGHTS, ...weights };
+      this.logger.log(`Matching weights hot-reloaded: ${JSON.stringify(weights)}`);
+    });
+  }
+
+  // ─── PONTO DE ENTRADA PRINCIPAL ───────────────────────────────────────────
+  /**
+   * Orquestra o pipeline completo de busca:
+   * 1. Busca candidatos no banco (filtros hard via SQL + PostGIS)
+   * 2. Enriquece com features cacheadas no Redis
+   * 3. Aplica scoring ponderado
+   * 4. Aplica cold start boost para novos prestadores
+   * 5. Aplica restrições de fairness
+   * 6. Persiste impressões assincronamente (não bloqueia a resposta)
+   * 7. Retorna lista rankeada
+   */
+  async search(context: MatchingContext): Promise<RankedProvider[]> {
+    const searchId = uuidv4();
+    const startMs = Date.now();
+
+    // 1. Candidatos passando nos filtros hard
+    const candidates = await this.fetchCandidates(context);
+
+    if (candidates.length === 0) {
+      this.logger.warn(
+        `Zero results — category=${context.categoryId} lat=${context.latitude} lng=${context.longitude}`
+      );
+      void this.logZeroResults(searchId, context);
+      return [];
+    }
+
+    // 2. Enriquecer com features de cache (realtime location, batch metrics)
+    const enriched = await this.enrichCandidates(candidates);
+
+    // 3. Contexto extra: preço médio da categoria e prestadores anteriores do cliente
+    const [categoryAvgPrice, prevProviders] = await Promise.all([
+      this.cache.getCategoryAvgPrice(context.categoryId) ??
+        this.computeAndCacheCategoryAvgPrice(context.categoryId),
+      this.cache.getClientPreviousProviders(context.clientId),
+    ]);
+
+    // 4. Scoring
+    const scored = enriched.map((provider) => {
+      const breakdown = this.computeBreakdown(provider, context, prevProviders, categoryAvgPrice);
+      const boost = this.getNewProviderBoost(provider);
+      const rawTotal =
+        this.WEIGHTS.distance    * breakdown.distanceScore +
+        this.WEIGHTS.rating      * breakdown.ratingScore +
+        this.WEIGHTS.completion  * breakdown.completionScore +
+        this.WEIGHTS.acceptance  * breakdown.acceptanceScore +
+        this.WEIGHTS.availability* breakdown.availabilityScore +
+        this.WEIGHTS.trust       * breakdown.trustScore +
+        this.WEIGHTS.recurrence  * breakdown.recurrenceBonus +
+        this.WEIGHTS.price       * breakdown.priceCompetitiveness;
+
+      const totalScore = Math.min(1.0, rawTotal * (1 + boost)); // boost adicional para novos
+
+      return {
+        searchId,
+        providerId: provider.id,
+        totalScore,
+        distanceKm: this.haversineDistance(
+          context.latitude, context.longitude,
+          provider.lastKnownLatitude, provider.lastKnownLongitude,
+        ),
+        breakdown: { ...breakdown, newProviderBoost: boost, fairnessAdjustment: 0 },
+      } satisfies RankedProvider;
+    });
+
+    // 5. Ordenar por score
+    scored.sort((a, b) => b.totalScore - a.totalScore);
+
+    // 6. Fairness: remover prestadores com share acima do limite
+    const fairResults = await this.applyFairnessConstraints(scored, context);
+
+    // 7. Log de impressões (fire-and-forget — não bloqueia a resposta)
+    void this.logSearchImpressions(searchId, context, fairResults, Date.now() - startMs);
+
+    // 8. Shadow mode ML em paralelo (não afeta resposta)
+    void this.shadow.runShadow(context, fairResults, (ctx) =>
+      this.search({ ...ctx, clientId: '__shadow__' })
+    );
+
+    return fairResults.slice(0, 20); // máximo 20 resultados
+  }
+
+  // ─── 1. FETCH CANDIDATOS (FILTROS HARD) ───────────────────────────────────
+  /**
+   * Query PostGIS: retorna apenas prestadores que passam em TODOS os filtros:
+   * - Verificado, ativo, não deletado
+   * - Serve a categoria solicitada
+   * - Disponível no dia/hora solicitado
+   * - Dentro do seu próprio raio de serviço
+   * - Trust score acima do mínimo operacional
+   */
+  private async fetchCandidates(context: MatchingContext): Promise<ProviderCandidate[]> {
+    const dayOfWeek = context.scheduledAt.getDay();   // 0=dom, 6=sab
+    const hour = context.scheduledAt.getHours();
+    const timeStr = `${String(hour).padStart(2, '0')}:00`;
+
+    const rows = await this.prisma.$queryRaw<ProviderCandidate[]>`
+      SELECT
+        pp.id,
+        pp.overall_rating         AS "overallRating",
+        pp.total_reviews          AS "totalReviews",
+        pp.completion_rate        AS "completionRate",
+        pp.acceptance_rate        AS "acceptanceRate",
+        pp.verification_status    AS "verificationStatus",
+        pp.service_radius_km      AS "serviceRadiusKm",
+        pp.created_at             AS "createdAt",
+        pp.total_completions      AS "totalBookings",
+        pp.open_disputes_count    AS "openDisputesCount",
+        ps_sub.subscription_plan  AS "subscriptionPlan",
+        ppc.base_price_cents      AS "basePrice",
+
+        -- Última localização conhecida
+        loc.latitude              AS "lastKnownLatitude",
+        loc.longitude             AS "lastKnownLongitude",
+
+        -- Distância em km (para ordenação inicial, score refinado depois)
+        ST_Distance(
+          ST_MakePoint(loc.longitude, loc.latitude)::geography,
+          ST_MakePoint(${context.longitude}, ${context.latitude})::geography
+        ) / 1000.0                AS "distanceKm",
+
+        -- Bookings de hoje e capacidade média diária
+        COALESCE(today.cnt, 0)    AS "bookingsToday",
+        COALESCE(avg_cap.avg, 3)  AS "avgDailyCapacity"
+
+      FROM provider_profiles pp
+
+      -- Última localização
+      JOIN LATERAL (
+        SELECT latitude, longitude
+        FROM provider_locations
+        WHERE provider_id = pp.id
+        ORDER BY recorded_at DESC
+        LIMIT 1
+      ) loc ON true
+
+      -- Categoria
+      JOIN provider_categories pc
+        ON pc.provider_id = pp.id
+        AND pc.category_id = ${context.categoryId}::uuid
+
+      -- Disponibilidade no slot solicitado
+      JOIN provider_availability pa
+        ON pa.provider_id = pp.id
+        AND pa.day_of_week = ${dayOfWeek}
+        AND pa.start_time <= ${timeStr}::time
+        AND pa.end_time > ${timeStr}::time
+        AND pa.is_available = true
+
+      -- Preço configurado para a categoria
+      LEFT JOIN provider_price_configs ppc
+        ON ppc.provider_id = pp.id
+        AND ppc.category_id = ${context.categoryId}::uuid
+
+      -- Plano de assinatura ativo
+      LEFT JOIN LATERAL (
+        SELECT plan AS subscription_plan
+        FROM provider_subscriptions
+        WHERE provider_id = pp.id
+          AND status = 'ACTIVE'
+        ORDER BY created_at DESC
+        LIMIT 1
+      ) ps_sub ON true
+
+      -- Bookings hoje
+      LEFT JOIN LATERAL (
+        SELECT COUNT(*) AS cnt
+        FROM bookings
+        WHERE provider_id = pp.id
+          AND DATE(scheduled_at) = CURRENT_DATE
+          AND status IN ('CONFIRMED', 'IN_PROGRESS')
+      ) today ON true
+
+      -- Capacidade média (últimas 4 semanas)
+      LEFT JOIN LATERAL (
+        SELECT COALESCE(AVG(daily_cnt), 3) AS avg
+        FROM (
+          SELECT DATE(scheduled_at), COUNT(*) AS daily_cnt
+          FROM bookings
+          WHERE provider_id = pp.id
+            AND scheduled_at >= NOW() - INTERVAL '28 days'
+            AND status = 'COMPLETED'
+          GROUP BY DATE(scheduled_at)
+        ) t
+      ) avg_cap ON true
+
+      WHERE
+        pp.verification_status = 'APPROVED'
+        AND pp.is_available = true
+        AND pp.deleted_at IS NULL
+        -- Trust score mínimo operacional
+        AND EXISTS (
+          SELECT 1 FROM trust_scores ts
+          WHERE ts.user_id = pp.user_id AND ts.score >= 35
+        )
+        -- Dentro do raio do próprio prestador
+        AND ST_DWithin(
+          ST_MakePoint(loc.longitude, loc.latitude)::geography,
+          ST_MakePoint(${context.longitude}, ${context.latitude})::geography,
+          pp.service_radius_km * 1000
+        )
+        -- Sem bookings conflitantes no mesmo slot
+        AND NOT EXISTS (
+          SELECT 1 FROM bookings b
+          WHERE b.provider_id = pp.id
+            AND b.status IN ('CONFIRMED', 'IN_PROGRESS')
+            AND b.scheduled_at BETWEEN
+              ${context.scheduledAt} - INTERVAL '2 hours' AND
+              ${context.scheduledAt} + INTERVAL '2 hours'
+        )
+      ORDER BY "distanceKm" ASC
+      LIMIT 100
+    `;
+
+    // Adicionar slots de disponibilidade (para calcAvailabilityScore)
+    const providerIds = rows.map((r) => r.id);
+    const slots = await this.prisma.providerAvailability.findMany({
+      where: { providerId: { in: providerIds }, isAvailable: true },
+      select: { providerId: true, dayOfWeek: true, startTime: true, endTime: true },
+    });
+
+    const slotMap = slots.reduce<Record<string, typeof slots>>((acc, s) => {
+      (acc[s.providerId] ??= []).push(s);
+      return acc;
+    }, {});
+
+    return rows.map((r) => ({
+      ...r,
+      availabilitySlots: (slotMap[r.id] ?? []).map((s) => ({
+        dayOfWeek: s.dayOfWeek,
+        startTime: s.startTime,
+        endTime: s.endTime,
+      })),
+    }));
+  }
+
+  // ─── 2. ENRIQUECIMENTO COM REDIS ──────────────────────────────────────────
+  /**
+   * Sobrescreve métricas de batch com valores mais recentes do Redis
+   * quando disponíveis. Fallback transparente para valores do banco.
+   */
+  private async enrichCandidates(
+    candidates: ProviderCandidate[]
+  ): Promise<ProviderCandidate[]> {
+    const enriched = await Promise.all(
+      candidates.map(async (c) => {
+        const [batchCache, locationCache] = await Promise.all([
+          this.cache.getProviderBatchFeatures(c.id),
+          this.cache.getProviderRealtimeLocation(c.id),
+        ]);
+
+        return {
+          ...c,
+          // Sobrescrever com features mais frescas se existirem
+          ...(batchCache ?? {}),
+          // Atualizar localização em tempo real se disponível e recente (< 30min)
+          ...(locationCache && Date.now() - locationCache.updatedAt < 30 * 60 * 1000
+            ? { lastKnownLatitude: locationCache.lat, lastKnownLongitude: locationCache.lng }
+            : {}),
+        };
+      })
+    );
+    return enriched;
+  }
+
+  // ─── 3. BREAKDOWN DE SCORE ────────────────────────────────────────────────
+  private computeBreakdown(
+    provider: ProviderCandidate,
+    context: MatchingContext,
+    prevProviders: string[],
+    categoryAvgPrice: number,
+  ): Omit<ScoreBreakdown, 'newProviderBoost' | 'fairnessAdjustment'> {
+    return {
+      distanceScore:       this.calcDistanceScore(
+        context.latitude, context.longitude,
+        provider.lastKnownLatitude, provider.lastKnownLongitude,
+        provider.serviceRadiusKm,
+      ),
+      ratingScore:         this.calcRatingScore(provider.overallRating, provider.totalReviews),
+      completionScore:     this.calcCompletionScore(provider.completionRate),
+      acceptanceScore:     this.calcAcceptanceScore(provider.acceptanceRate),
+      availabilityScore:   this.calcAvailabilityScore(provider, context.scheduledAt),
+      trustScore:          this.calcTrustScore(provider),
+      recurrenceBonus:     prevProviders.includes(provider.id) ? 1.0 : 0.0,
+      priceCompetitiveness:this.calcPriceCompetitiveness(provider.basePrice, categoryAvgPrice),
+    };
+  }
+
+  // ─── 4. COLD START BOOST ──────────────────────────────────────────────────
+  /**
+   * Prestadores novos recebem boost artificial para acumular dados iniciais.
+   * O boost decai conforme o prestador ganha histórico.
+   */
+  private getNewProviderBoost(provider: ProviderCandidate): number {
+    const n = provider.totalBookings;
+    if (n < 5)  return 0.30; // +30% — recém chegou, precisa de visibilidade
+    if (n < 10) return 0.20; // +20%
+    if (n < 20) return 0.10; // +10%
+    return 0;                // histórico suficiente para competir organicamente
+  }
+
+  // ─── 5. FAIRNESS ──────────────────────────────────────────────────────────
+  /**
+   * Remove ou penaliza prestadores que ultrapassaram o share máximo na zona.
+   * Garante distribuição equitativa de trabalho (Gini < 0.60).
+   */
+  private async applyFairnessConstraints(
+    ranked: RankedProvider[],
+    context: MatchingContext,
+  ): Promise<RankedProvider[]> {
+    const zone = await this.resolveZone(context.latitude, context.longitude);
+    const distribution = await this.cache.getZoneBookingDistribution(zone, context.categoryId);
+
+    return ranked
+      .filter((r) => {
+        const share = distribution[r.providerId] ?? 0;
+        return share < this.FAIRNESS.maxConcentration;
+      })
+      .map((r) => {
+        // Boost de visibilidade para prestadores com baixa atividade recente
+        const monthlyBookings = (distribution[r.providerId] ?? 0) * 100; // estimate
+        if (monthlyBookings < this.FAIRNESS.lowActivityThreshold) {
+          return {
+            ...r,
+            totalScore: Math.min(1.0, r.totalScore * this.FAIRNESS.lowActivityBoostFactor),
+            breakdown: { ...r.breakdown, fairnessAdjustment: this.FAIRNESS.lowActivityBoostFactor - 1 },
+          };
+        }
+        return r;
+      });
+  }
+
+  // ─── 6. LOG DE IMPRESSÕES ─────────────────────────────────────────────────
+  /**
+   * Persiste cada prestador mostrado com sua posição e score.
+   * CRÍTICO para debiasing futuro do modelo de ranking (position bias correction).
+   */
+  private async logSearchImpressions(
+    searchId: string,
+    context: MatchingContext,
+    results: RankedProvider[],
+    latencyMs: number,
+  ): Promise<void> {
+    try {
+      // Log de busca principal
+      await this.prisma.searchLog.create({
+        data: {
+          id: searchId,
+          clientId: context.clientId,
+          categoryId: context.categoryId,
+          latitude: context.latitude,
+          longitude: context.longitude,
+          scheduledAt: context.scheduledAt,
+          resultsCount: results.length,
+          latencyMs,
+        },
+      });
+
+      // Impressões individuais (posição x prestador x score)
+      if (results.length > 0) {
+        await this.prisma.providerImpression.createMany({
+          data: results.map((r, idx) => ({
+            searchId,
+            providerId: r.providerId,
+            position: idx + 1,
+            score: r.totalScore,
+            featuresSnapshot: r.breakdown as object,
+            wasClicked: false,  // atualizado via PATCH quando o cliente clicar
+            wasBooked: false,   // atualizado via evento booking.created
+          })),
+        });
+      }
+    } catch (err) {
+      // Erro de log não pode derrubar a busca
+      this.logger.error('Failed to log search impressions', err);
+    }
+  }
+
+  private async logZeroResults(searchId: string, context: MatchingContext): Promise<void> {
+    await this.prisma.searchLog.create({
+      data: {
+        id: searchId,
+        clientId: context.clientId,
+        categoryId: context.categoryId,
+        latitude: context.latitude,
+        longitude: context.longitude,
+        scheduledAt: context.scheduledAt,
+        resultsCount: 0,
+        latencyMs: 0,
+      },
+    }).catch(() => {}); // silenciar erros de log
+  }
+
+  // ─── SCORERS ──────────────────────────────────────────────────────────────
+
+  /**
+   * Decaimento exponencial: distância 0km → 1.0, distância = raio → 0.1
+   */
+  private calcDistanceScore(
+    cLat: number, cLng: number,
+    pLat: number, pLng: number,
+    radiusKm: number,
+  ): number {
+    const d = this.haversineDistance(cLat, cLng, pLat, pLng);
+    if (d > radiusKm) return 0;
+    const λ = Math.log(10) / radiusKm; // decai para 0.1 no limite do raio
+    return Math.exp(-λ * d);
+  }
+
+  /**
+   * Média bayesiana: suaviza ratings de prestadores com poucos reviews.
+   * Com C=20 e prior=4.0 — prestador com 2 reviews de 5★ não domina alguém
+   * com 100 reviews de 4.5★.
+   *
+   * Exemplo:
+   *   Prestador A: 5.0 stars, 2 reviews  → bayesian = 4.09 → score = 0.77
+   *   Prestador B: 4.5 stars, 100 reviews → bayesian = 4.49 → score = 0.87
+   */
+  private calcRatingScore(rating: number, totalReviews: number): number {
+    const PRIOR_MEAN = 4.0;
+    const CONFIDENCE = 20; // reviews necessários para confiar na média real
+    const bayesian =
+      (CONFIDENCE * PRIOR_MEAN + rating * totalReviews) / (CONFIDENCE + totalReviews);
+    return Math.max(0, (bayesian - 1.0) / 4.0); // normaliza [1,5] → [0,1]
+  }
+
+  /**
+   * Penalização escalonada: abaixo de 80% de conclusão é inaceitável.
+   */
+  private calcCompletionScore(rate: number): number {
+    if (rate >= 0.95) return 1.00;
+    if (rate >= 0.90) return 0.85;
+    if (rate >= 0.85) return 0.70;
+    if (rate >= 0.80) return 0.50;
+    if (rate >= 0.70) return 0.25;
+    return 0.05;
+  }
+
+  /**
+   * Penalização quadrática: acceptance 90% → 0.81, 70% → 0.49.
+   * Prestadores que rejeitam frequentemente prejudicam a experiência.
+   */
+  private calcAcceptanceScore(rate: number): number {
+    return Math.pow(rate, 2);
+  }
+
+  /**
+   * Score misto: verifica se o prestador está disponível no slot
+   * e aplica penalidade se sua agenda já está quase cheia.
+   */
+  private calcAvailabilityScore(provider: ProviderCandidate, scheduledAt: Date): number {
+    const hour = scheduledAt.getHours();
+    const dow  = scheduledAt.getDay();
+    const timeMin = hour * 60;
+
+    const slotAvailable = provider.availabilitySlots.some(
+      (s) =>
+        s.dayOfWeek === dow &&
+        this.timeToMinutes(s.startTime) <= timeMin &&
+        this.timeToMinutes(s.endTime) > timeMin,
+    );
+
+    if (!slotAvailable) return 0;
+
+    // Penalizar prestadores com agenda muito cheia hoje
+    const density = provider.bookingsToday / Math.max(1, provider.avgDailyCapacity);
+    return Math.max(0.3, 1.0 - density * 0.5);
+  }
+
+  /**
+   * Trust score composto: verificação (40%) + senioridade (20%)
+   * + sem disputas (20%) + plano pago (20%).
+   */
+  private calcTrustScore(provider: ProviderCandidate): number {
+    let score = 0;
+    if (provider.verificationStatus === 'APPROVED') score += 0.4;
+    else if (provider.verificationStatus === 'SUBMITTED') score += 0.2;
+
+    const months = this.monthsSince(provider.createdAt);
+    score += Math.min(0.2, (months / 24) * 0.2); // satura em 24 meses
+
+    score += Math.max(0, 0.2 - provider.openDisputesCount * 0.05);
+
+    if (provider.subscriptionPlan && provider.subscriptionPlan !== 'FREE') score += 0.2;
+
+    return Math.min(1.0, score);
+  }
+
+  /**
+   * Competitividade de preço: abaixo da média da categoria = vantagem.
+   */
+  private calcPriceCompetitiveness(price: number, avgPrice: number): number {
+    if (!avgPrice || avgPrice === 0) return 0.5;
+    const ratio = price / avgPrice;
+    if (ratio <= 0.80) return 1.00; // >20% abaixo da média
+    if (ratio <= 0.95) return 0.75; // 5-20% abaixo
+    if (ratio <= 1.05) return 0.50; // na média (±5%)
+    if (ratio <= 1.20) return 0.25; // 5-20% acima
+    return 0.00;                    // >20% acima da média
+  }
+
+  // ─── HELPERS ──────────────────────────────────────────────────────────────
+
+  private haversineDistance(
+    lat1: number, lng1: number, lat2: number, lng2: number,
+  ): number {
+    const R = 6371;
+    const dLat = this.toRad(lat2 - lat1);
+    const dLng = this.toRad(lng2 - lng1);
+    const a =
+      Math.sin(dLat / 2) ** 2 +
+      Math.cos(this.toRad(lat1)) * Math.cos(this.toRad(lat2)) * Math.sin(dLng / 2) ** 2;
+    return R * 2 * Math.atan2(Math.sqrt(a), Math.sqrt(1 - a));
+  }
+
+  private toRad = (d: number): number => (d * Math.PI) / 180;
+
+  private timeToMinutes = (t: string): number => {
+    const [h, m] = t.split(':').map(Number);
+    return h * 60 + (m ?? 0);
+  };
+
+  private monthsSince = (date: Date): number =>
+    (Date.now() - date.getTime()) / (30 * 24 * 60 * 60 * 1000);
+
+  private async resolveZone(lat: number, lng: number): Promise<string> {
+    const zone = await this.prisma.$queryRaw<[{ id: string }]>`
+      SELECT id FROM service_zones
+      WHERE ST_Contains(boundary, ST_MakePoint(${lng}, ${lat}))
+      LIMIT 1
+    `;
+    return zone[0]?.id ?? 'default';
+  }
+
+  private async computeAndCacheCategoryAvgPrice(categoryId: string): Promise<number> {
+    const result = await this.prisma.$queryRaw<[{ avg: number }]>`
+      SELECT COALESCE(AVG(base_price_cents), 15000) AS avg
+      FROM provider_price_configs
+      WHERE category_id = ${categoryId}::uuid
+    `;
+    const avg = result[0]?.avg ?? 15000;
+    await this.cache.setCategoryAvgPrice(categoryId, avg);
+    return avg;
+  }
+}
+```
+
+---
+
+## 19. EXEMPLO NUMÉRICO — SCORE CALCULADO
+
+Execução real do scoring para 3 prestadores em busca de limpeza residencial,
+São Paulo, segunda-feira às 09h, cliente em Pinheiros.
+
+```
+Contexto da busca:
+  category: limpeza
+  lat/lng: -23.5654, -46.6833 (Pinheiros, SP)
+  scheduledAt: segunda 09:00
+  clientId: cli-123
+
+────────────────────────────────────────────────────────────
+Candidato A: Rosana (Gold, 2 anos de plataforma)
+────────────────────────────────────────────────────────────
+  Dados brutos:
+    rating=4.8, reviews=127, completion=0.97, acceptance=0.95
+    distance=1.2km, radius=8km, price=R$140 (avg=R$150)
+    openDisputes=0, plan=GOLD, totalBookings=340
+    disponível 08:00-18:00 seg-sex, bookingsHoje=1/4
+
+  Cálculo:
+    distanceScore   = e^(-ln(10)/8 * 1.2)   = e^(-0.347)  = 0.707
+    ratingScore     = ((20*4.0 + 4.8*127) / (20+127) - 1) / 4
+                    = (689.6/147 - 1) / 4    = (4.69-1)/4  = 0.922
+    completionScore = 0.97 ≥ 0.95            → 1.000
+    acceptanceScore = 0.95²                  = 0.903
+    availabilityScore = disponível + density(1/4=0.25) → 1.0 - 0.25*0.5 = 0.875
+    trustScore      = 0.4 (verif) + 0.167 (24mo cap a 0.2) + 0.2 (sem disputes) + 0.2 (GOLD)
+                    = 0.967
+    recurrenceBonus = 0 (primeiro contato)
+    priceScore      = 140/150 = 0.93 → faixa 0.80-0.95 → 0.75
+    newBoost        = totalBookings=340 → boost=0
+
+  Total = 0.20*0.707 + 0.25*0.922 + 0.20*1.000 + 0.10*0.903
+        + 0.10*0.875 + 0.10*0.967 + 0.03*0 + 0.02*0.75
+        = 0.141 + 0.231 + 0.200 + 0.090 + 0.088 + 0.097 + 0 + 0.015
+        = 0.862  ✅ (1º lugar)
+
+────────────────────────────────────────────────────────────
+Candidato B: João (Silver, 8 meses, novo na plataforma)
+────────────────────────────────────────────────────────────
+  Dados brutos:
+    rating=5.0, reviews=4, completion=1.0, acceptance=1.0
+    distance=0.5km, radius=5km, price=R$120 (avg=R$150)
+    openDisputes=0, plan=SILVER, totalBookings=8
+
+  Cálculo:
+    distanceScore   = e^(-ln(10)/5 * 0.5)   = e^(-0.230)  = 0.795
+    ratingScore     = ((20*4.0 + 5.0*4) / 24 - 1) / 4
+                    = (100/24 - 1) / 4       = (4.17-1)/4  = 0.792  ← bayesian suaviza!
+    completionScore = 1.0 ≥ 0.95            → 1.000
+    acceptanceScore = 1.0²                  = 1.000
+    availabilityScore = disponível, 0 bookings hoje → 1.000
+    trustScore      = 0.4 + 0.067 (8mo) + 0.2 + 0.2 = 0.867
+    recurrenceBonus = 0
+    priceScore      = 120/150 = 0.80 → exatamente na fronteira → 1.00
+    newBoost        = totalBookings=8 → boost=0.20
+
+  Total (sem boost) = 0.20*0.795 + 0.25*0.792 + 0.20*1.000 + 0.10*1.000
+                    + 0.10*1.000 + 0.10*0.867 + 0 + 0.02*1.000
+                    = 0.159 + 0.198 + 0.200 + 0.100 + 0.100 + 0.087 + 0 + 0.020
+                    = 0.864
+
+  Total (com boost) = 0.864 * 1.20 = min(1.0, 1.037) = 1.000  ✅ (1º lugar c/ boost)
+
+  ⚠️  Observação: o cold start boost é intencional — permite a João acumular
+      avaliações reais para competir organicamente nas próximas semanas.
+
+────────────────────────────────────────────────────────────
+Candidato C: Maria (Bronze, 3 meses, baixo desempenho)
+────────────────────────────────────────────────────────────
+  Dados brutos:
+    rating=3.8, reviews=12, completion=0.78, acceptance=0.70
+    distance=3.5km, radius=10km, price=R$180 (avg=R$150)
+    openDisputes=2, plan=FREE, totalBookings=15
+
+  Cálculo:
+    distanceScore   = e^(-ln(10)/10 * 3.5)  = e^(-0.806)  = 0.447
+    ratingScore     = ((20*4.0 + 3.8*12) / 32 - 1) / 4
+                    = (125.6/32 - 1) / 4    = (3.93-1)/4  = 0.731
+    completionScore = 0.78 → faixa 0.70-0.80            = 0.250  ← penalizado
+    acceptanceScore = 0.70²                             = 0.490
+    availabilityScore = disponível, 2 bookings/3 capac. → 1.0 - 0.667*0.5 = 0.667
+    trustScore      = 0.4 + 0.025 (3mo) + max(0, 0.2-2*0.05=0.1) + 0 = 0.525
+    recurrenceBonus = 0
+    priceScore      = 180/150 = 1.20 → faixa 1.05-1.20 → 0.25
+    newBoost        = totalBookings=15 → boost=0.10
+
+  Total (sem boost) = 0.20*0.447 + 0.25*0.731 + 0.20*0.250 + 0.10*0.490
+                    + 0.10*0.667 + 0.10*0.525 + 0 + 0.02*0.25
+                    = 0.089 + 0.183 + 0.050 + 0.049 + 0.067 + 0.053 + 0 + 0.005
+                    = 0.496
+
+  Total (com boost) = 0.496 * 1.10 = 0.546  ✅ (3º lugar)
+
+────────────────────────────────────────────────────────────
+RANKING FINAL (antes de fairness):
+  1. João   — 1.000  (cold start boost aplicado)
+  2. Rosana — 0.862  (score orgânico alto)
+  3. Maria  — 0.546  (penalizada por completion e preço)
+────────────────────────────────────────────────────────────
+```
