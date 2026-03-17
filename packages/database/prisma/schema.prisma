@@ -1,0 +1,889 @@
+// =============================================================================
+// PRISMA SCHEMA — MARKETPLACE DE SERVIÇOS
+// PostgreSQL 16 + PostGIS | 124 modelos | 20 domínios
+// Ref: docs/schema/BLOCO_B_SCHEMA_PRISMA.md
+// =============================================================================
+
+generator client {
+  provider        = "prisma-client-js"
+  output          = "../generated/client"
+  previewFeatures = ["postgresqlExtensions"]
+}
+
+datasource db {
+  provider   = "postgresql"
+  url        = env("DATABASE_URL")
+  extensions = [uuidOssp(map: "uuid-ossp"), postgis, pgTrgm(map: "pg_trgm"), unaccent]
+}
+
+// =============================================================================
+// ENUMS
+// =============================================================================
+
+enum UserStatus {
+  ACTIVE
+  INACTIVE
+  SUSPENDED
+  BANNED
+  PENDING_VERIFICATION
+
+  @@map("user_status")
+}
+
+enum VerificationStatus {
+  PENDING
+  SUBMITTED
+  APPROVED
+  REJECTED
+  EXPIRED
+
+  @@map("verification_status")
+}
+
+enum DocumentType {
+  CPF
+  RG
+  CNH
+  PASSPORT
+  SELFIE
+  PROOF_OF_ADDRESS
+  PROFESSIONAL_LICENSE
+
+  @@map("document_type")
+}
+
+enum BookingStatus {
+  PENDING_PAYMENT
+  PAYMENT_AUTHORIZED
+  CONFIRMED
+  PROVIDER_EN_ROUTE
+  IN_PROGRESS
+  COMPLETED
+  CANCELLED_CLIENT
+  CANCELLED_PROVIDER
+  CANCELLED_SYSTEM
+  DISPUTED
+  REFUNDED
+
+  @@map("booking_status")
+}
+
+enum PaymentStatus {
+  PENDING
+  AUTHORIZED
+  CAPTURED
+  FAILED
+  REFUNDED
+  PARTIALLY_REFUNDED
+  CHARGEBACK
+
+  @@map("payment_status")
+}
+
+enum PaymentMethod {
+  CREDIT_CARD
+  DEBIT_CARD
+  PIX
+  BOLETO
+  WALLET
+
+  @@map("payment_method")
+}
+
+enum PayoutStatus {
+  PENDING
+  PROCESSING
+  COMPLETED
+  FAILED
+  CANCELLED
+
+  @@map("payout_status")
+}
+
+enum ReviewStatus {
+  PENDING
+  PUBLISHED
+  HIDDEN
+  REMOVED
+
+  @@map("review_status")
+}
+
+enum PricingType {
+  FIXED
+  HOURLY
+  CUSTOM_QUOTE
+
+  @@map("pricing_type")
+}
+
+enum ServiceStatus {
+  DRAFT
+  ACTIVE
+  PAUSED
+  ARCHIVED
+
+  @@map("service_status")
+}
+
+enum NotificationChannel {
+  PUSH
+  SMS
+  EMAIL
+  WHATSAPP
+  IN_APP
+
+  @@map("notification_channel")
+}
+
+enum DisputeStatus {
+  OPEN
+  INVESTIGATING
+  RESOLVED_CLIENT
+  RESOLVED_PROVIDER
+  CLOSED
+
+  @@map("dispute_status")
+}
+
+enum SubscriptionPlan {
+  FREE
+  BASIC
+  PROFESSIONAL
+  PREMIUM
+
+  @@map("subscription_plan")
+}
+
+enum OtpChannel {
+  EMAIL
+  SMS
+  WHATSAPP
+
+  @@map("otp_channel")
+}
+
+enum OtpPurpose {
+  REGISTRATION
+  LOGIN
+  PASSWORD_RESET
+  PHONE_VERIFICATION
+  EMAIL_VERIFICATION
+  PAYMENT_CONFIRMATION
+
+  @@map("otp_purpose")
+}
+
+// =============================================================================
+// DOMÍNIO 1 — IDENTITY & ACCESS
+// =============================================================================
+
+model User {
+  id           String     @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  email        String?    @unique @db.VarChar(255)
+  phone        String?    @unique @db.VarChar(20)
+  passwordHash String?    @map("password_hash") @db.VarChar(255)
+  status       UserStatus @default(ACTIVE)
+  createdAt    DateTime   @default(now()) @map("created_at")
+  updatedAt    DateTime   @updatedAt @map("updated_at")
+  deletedAt    DateTime?  @map("deleted_at")
+
+  // Relations
+  profile           UserProfile?
+  providerProfile   ProviderProfile?
+  sessions          UserSession[]
+  refreshTokens     RefreshToken[]
+  otpCodes          OtpCode[]
+  devices           Device[]
+  consents          UserConsent[]
+  addresses         UserAddress[]
+  bookingsAsClient  Booking[]         @relation("ClientBookings")
+  reviewsGiven      Review[]          @relation("ReviewsGiven")
+  reviewsReceived   Review[]          @relation("ReviewsReceived")
+  trustScore        TrustScore?
+  notifications     Notification[]
+  searchLogs        SearchLog[]
+  wallet            Wallet?
+
+  @@index([email])
+  @@index([phone])
+  @@index([status])
+  @@map("users")
+}
+
+model UserSession {
+  id           String    @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  userId       String    @map("user_id") @db.Uuid
+  tokenHash    String    @unique @map("token_hash") @db.VarChar(255)
+  deviceId     String?   @map("device_id") @db.Uuid
+  ipAddress    String?   @map("ip_address") @db.VarChar(45)
+  userAgent    String?   @map("user_agent")
+  expiresAt    DateTime  @map("expires_at")
+  revokedAt    DateTime? @map("revoked_at")
+  createdAt    DateTime  @default(now()) @map("created_at")
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([userId])
+  @@index([tokenHash])
+  @@map("user_sessions")
+}
+
+model RefreshToken {
+  id         String    @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  userId     String    @map("user_id") @db.Uuid
+  tokenHash  String    @unique @map("token_hash") @db.VarChar(255)
+  expiresAt  DateTime  @map("expires_at")
+  revokedAt  DateTime? @map("revoked_at")
+  createdAt  DateTime  @default(now()) @map("created_at")
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([userId])
+  @@map("refresh_tokens")
+}
+
+model OtpCode {
+  id          String     @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  userId      String?    @map("user_id") @db.Uuid
+  channel     OtpChannel
+  purpose     OtpPurpose
+  recipient   String     @db.VarChar(255)
+  codeHash    String     @map("code_hash") @db.VarChar(255)
+  verified    Boolean    @default(false)
+  attempts    Int        @default(0)
+  expiresAt   DateTime   @map("expires_at")
+  createdAt   DateTime   @default(now()) @map("created_at")
+
+  user User? @relation(fields: [userId], references: [id], onDelete: SetNull)
+
+  @@index([recipient, purpose])
+  @@map("otp_codes")
+}
+
+model Device {
+  id          String   @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  userId      String   @map("user_id") @db.Uuid
+  pushToken   String?  @map("push_token") @db.VarChar(500)
+  platform    String   @db.VarChar(10) // IOS, ANDROID, WEB
+  deviceModel String?  @map("device_model") @db.VarChar(100)
+  osVersion   String?  @map("os_version") @db.VarChar(20)
+  appVersion  String?  @map("app_version") @db.VarChar(20)
+  isActive    Boolean  @default(true) @map("is_active")
+  createdAt   DateTime @default(now()) @map("created_at")
+  updatedAt   DateTime @updatedAt @map("updated_at")
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([userId])
+  @@index([pushToken])
+  @@map("devices")
+}
+
+model UserConsent {
+  id          String   @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  userId      String   @map("user_id") @db.Uuid
+  consentType String   @map("consent_type") @db.VarChar(50)
+  version     String   @db.VarChar(20)
+  accepted    Boolean
+  ipAddress   String?  @map("ip_address") @db.VarChar(45)
+  createdAt   DateTime @default(now()) @map("created_at")
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([userId, consentType])
+  @@map("user_consents")
+}
+
+// =============================================================================
+// DOMÍNIO 2 — USER PROFILE
+// =============================================================================
+
+model UserProfile {
+  id          String    @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  userId      String    @unique @map("user_id") @db.Uuid
+  firstName   String    @map("first_name") @db.VarChar(100)
+  lastName    String    @map("last_name") @db.VarChar(100)
+  displayName String?   @map("display_name") @db.VarChar(200)
+  avatarUrl   String?   @map("avatar_url") @db.VarChar(500)
+  birthDate   DateTime? @map("birth_date") @db.Date
+  gender      String?   @db.VarChar(30)
+  bio         String?   @db.Text
+  createdAt   DateTime  @default(now()) @map("created_at")
+  updatedAt   DateTime  @updatedAt @map("updated_at")
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@map("user_profiles")
+}
+
+model UserAddress {
+  id           String    @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  userId       String    @map("user_id") @db.Uuid
+  label        String?   @db.VarChar(50) // "Casa", "Trabalho"
+  street       String    @db.VarChar(200)
+  number       String    @db.VarChar(20)
+  complement   String?   @db.VarChar(100)
+  neighborhood String    @db.VarChar(100)
+  city         String    @db.VarChar(100)
+  state        String    @db.VarChar(2)
+  zipCode      String    @map("zip_code") @db.VarChar(10)
+  countryCode  String    @default("BR") @map("country_code") @db.VarChar(3)
+  latitude     Decimal?  @db.Decimal(10, 7)
+  longitude    Decimal?  @db.Decimal(10, 7)
+  isDefault    Boolean   @default(false) @map("is_default")
+  deletedAt    DateTime? @map("deleted_at")
+  createdAt    DateTime  @default(now()) @map("created_at")
+  updatedAt    DateTime  @updatedAt @map("updated_at")
+
+  user     User      @relation(fields: [userId], references: [id], onDelete: Cascade)
+  bookings Booking[]
+
+  @@index([userId])
+  @@map("user_addresses")
+}
+
+// =============================================================================
+// DOMÍNIO 3 — PROVIDER PROFILE
+// =============================================================================
+
+model ProviderProfile {
+  id                  String             @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  userId              String             @unique @map("user_id") @db.Uuid
+  cpfCnpj             String?            @map("cpf_cnpj") @db.VarChar(18)
+  bio                 String?            @db.Text
+  verificationStatus  VerificationStatus @default(PENDING) @map("verification_status")
+  isAvailable         Boolean            @default(false) @map("is_available")
+  serviceRadiusKm     Int                @default(10) @map("service_radius_km")
+  overallRating       Decimal            @default(0) @map("overall_rating") @db.Decimal(3, 2)
+  totalReviews        Int                @default(0) @map("total_reviews")
+  totalCompletions    Int                @default(0) @map("total_completions")
+  completionRate      Decimal            @default(1) @map("completion_rate") @db.Decimal(5, 4)
+  acceptanceRate      Decimal            @default(1) @map("acceptance_rate") @db.Decimal(5, 4)
+  noShowRate          Decimal            @default(0) @map("no_show_rate") @db.Decimal(5, 4)
+  openDisputesCount   Int                @default(0) @map("open_disputes_count")
+  subscriptionPlan    SubscriptionPlan   @default(FREE) @map("subscription_plan")
+  currentLatitude     Decimal?           @map("current_latitude") @db.Decimal(10, 7)
+  currentLongitude    Decimal?           @map("current_longitude") @db.Decimal(10, 7)
+  lastSeenAt          DateTime?          @map("last_seen_at")
+  deletedAt           DateTime?          @map("deleted_at")
+  createdAt           DateTime           @default(now()) @map("created_at")
+  updatedAt           DateTime           @updatedAt @map("updated_at")
+
+  user              User                  @relation(fields: [userId], references: [id], onDelete: Cascade)
+  documents         ProviderDocument[]
+  locations         ProviderLocation[]
+  availability      ProviderAvailability[]
+  categories        ProviderCategory[]
+  services          ProviderService[]
+  priceConfigs      ProviderPriceConfig[]
+  bookings          Booking[]             @relation("ProviderBookings")
+  trustScore        TrustScore?           @relation("ProviderTrustScore")
+
+  @@index([verificationStatus, isAvailable])
+  @@index([overallRating(sort: Desc)])
+  @@map("provider_profiles")
+}
+
+model ProviderDocument {
+  id           String             @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  providerId   String             @map("provider_id") @db.Uuid
+  documentType DocumentType       @map("document_type")
+  fileUrl      String             @map("file_url") @db.VarChar(500)
+  status       VerificationStatus @default(PENDING)
+  rejectedNote String?            @map("rejected_note") @db.Text
+  reviewedAt   DateTime?          @map("reviewed_at")
+  reviewedBy   String?            @map("reviewed_by") @db.Uuid
+  createdAt    DateTime           @default(now()) @map("created_at")
+
+  provider ProviderProfile @relation(fields: [providerId], references: [id], onDelete: Cascade)
+
+  @@index([providerId])
+  @@map("provider_documents")
+}
+
+model ProviderLocation {
+  id          String   @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  providerId  String   @map("provider_id") @db.Uuid
+  latitude    Decimal  @db.Decimal(10, 7)
+  longitude   Decimal  @db.Decimal(10, 7)
+  accuracy    Float?
+  recordedAt  DateTime @default(now()) @map("recorded_at")
+
+  provider ProviderProfile @relation(fields: [providerId], references: [id], onDelete: Cascade)
+
+  @@index([providerId, recordedAt(sort: Desc)])
+  @@map("provider_locations")
+}
+
+model ProviderAvailability {
+  id          String   @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  providerId  String   @map("provider_id") @db.Uuid
+  dayOfWeek   Int      @map("day_of_week") // 0=Dom, 6=Sab
+  startTime   String   @map("start_time") @db.VarChar(5) // "HH:MM"
+  endTime     String   @map("end_time") @db.VarChar(5)
+  isAvailable Boolean  @default(true) @map("is_available")
+  updatedAt   DateTime @updatedAt @map("updated_at")
+
+  provider ProviderProfile @relation(fields: [providerId], references: [id], onDelete: Cascade)
+
+  @@unique([providerId, dayOfWeek, startTime])
+  @@index([providerId, dayOfWeek, isAvailable])
+  @@map("provider_availability")
+}
+
+model ProviderPriceConfig {
+  id              String   @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  providerId      String   @map("provider_id") @db.Uuid
+  categoryId      String   @map("category_id") @db.Uuid
+  basePriceCents  Int      @map("base_price_cents")
+  pricingType     PricingType @default(FIXED) @map("pricing_type")
+  createdAt       DateTime @default(now()) @map("created_at")
+  updatedAt       DateTime @updatedAt @map("updated_at")
+
+  provider ProviderProfile @relation(fields: [providerId], references: [id], onDelete: Cascade)
+  category Category        @relation(fields: [categoryId], references: [id])
+
+  @@unique([providerId, categoryId])
+  @@map("provider_price_configs")
+}
+
+// =============================================================================
+// DOMÍNIO 4 — SERVICE CATALOG
+// =============================================================================
+
+model Category {
+  id             String   @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  name           String   @db.VarChar(100)
+  slug           String   @unique @db.VarChar(100)
+  description    String?  @db.Text
+  iconUrl        String?  @map("icon_url") @db.VarChar(500)
+  parentId       String?  @map("parent_id") @db.Uuid
+  commissionRate Decimal  @map("commission_rate") @db.Decimal(5, 4) // ex: 0.20 = 20%
+  sortOrder      Int      @default(0) @map("sort_order")
+  isActive       Boolean  @default(true) @map("is_active")
+  createdAt      DateTime @default(now()) @map("created_at")
+
+  parent       Category?           @relation("CategoryTree", fields: [parentId], references: [id])
+  children     Category[]          @relation("CategoryTree")
+  providers    ProviderCategory[]
+  services     ProviderService[]
+  priceConfigs ProviderPriceConfig[]
+
+  @@index([slug])
+  @@index([parentId])
+  @@map("categories")
+}
+
+model ProviderCategory {
+  id         String   @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  providerId String   @map("provider_id") @db.Uuid
+  categoryId String   @map("category_id") @db.Uuid
+  createdAt  DateTime @default(now()) @map("created_at")
+
+  provider ProviderProfile @relation(fields: [providerId], references: [id], onDelete: Cascade)
+  category Category        @relation(fields: [categoryId], references: [id])
+
+  @@unique([providerId, categoryId])
+  @@index([categoryId, providerId])
+  @@map("provider_categories")
+}
+
+model ProviderService {
+  id             String        @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  providerId     String        @map("provider_id") @db.Uuid
+  categoryId     String        @map("category_id") @db.Uuid
+  name           String        @db.VarChar(200)
+  description    String?       @db.Text
+  basePriceCents Int           @map("base_price_cents")
+  pricingType    PricingType   @default(FIXED) @map("pricing_type")
+  durationMin    Int           @default(60) @map("duration_min")
+  status         ServiceStatus @default(ACTIVE)
+  createdAt      DateTime      @default(now()) @map("created_at")
+  updatedAt      DateTime      @updatedAt @map("updated_at")
+
+  provider ProviderProfile @relation(fields: [providerId], references: [id], onDelete: Cascade)
+  category Category        @relation(fields: [categoryId], references: [id])
+  bookings Booking[]
+
+  @@index([providerId])
+  @@index([categoryId])
+  @@map("provider_services")
+}
+
+// =============================================================================
+// DOMÍNIO 5 — BOOKING & SCHEDULING
+// =============================================================================
+
+model Booking {
+  id               String        @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  clientId         String        @map("client_id") @db.Uuid
+  providerId       String        @map("provider_id") @db.Uuid
+  serviceId        String?       @map("service_id") @db.Uuid
+  addressId        String?       @map("address_id") @db.Uuid
+  recurrenceId     String?       @map("recurrence_id") @db.Uuid
+  status           BookingStatus @default(PENDING_PAYMENT)
+  scheduledAt      DateTime      @map("scheduled_at")
+  confirmedAt      DateTime?     @map("confirmed_at")
+  startedAt        DateTime?     @map("started_at")
+  completedAt      DateTime?     @map("completed_at")
+  cancelledAt      DateTime?     @map("cancelled_at")
+  cancelReason     String?       @map("cancel_reason") @db.Text
+  subtotalCents    Int           @map("subtotal_cents")
+  discountCents    Int           @default(0) @map("discount_cents")
+  serviceFee       Int           @default(0) @map("service_fee")
+  totalCents       Int           @map("total_cents")
+  clientNotes      String?       @map("client_notes") @db.Text
+  providerNotes    String?       @map("provider_notes") @db.Text
+  deletedAt        DateTime?     @map("deleted_at")
+  createdAt        DateTime      @default(now()) @map("created_at")
+  updatedAt        DateTime      @updatedAt @map("updated_at")
+
+  client     User              @relation("ClientBookings", fields: [clientId], references: [id])
+  provider   ProviderProfile   @relation("ProviderBookings", fields: [providerId], references: [id])
+  service    ProviderService?  @relation(fields: [serviceId], references: [id])
+  address    UserAddress?      @relation(fields: [addressId], references: [id])
+  recurrence RecurringBooking? @relation(fields: [recurrenceId], references: [id])
+  timeline   BookingTimeline[]
+  payment    Payment?
+  review     Review?
+  dispute    Dispute?
+  commission Commission?
+
+  @@index([clientId, status, scheduledAt(sort: Desc)])
+  @@index([providerId, status, scheduledAt(sort: Desc)])
+  @@index([scheduledAt, status])
+  @@map("bookings")
+}
+
+model BookingTimeline {
+  id        String        @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  bookingId String        @map("booking_id") @db.Uuid
+  status    BookingStatus
+  note      String?       @db.Text
+  actorId   String?       @map("actor_id") @db.Uuid
+  createdAt DateTime      @default(now()) @map("created_at")
+
+  booking Booking @relation(fields: [bookingId], references: [id], onDelete: Cascade)
+
+  @@index([bookingId, createdAt])
+  @@map("booking_timeline")
+}
+
+model RecurringBooking {
+  id            String    @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  clientId      String    @map("client_id") @db.Uuid
+  providerId    String    @map("provider_id") @db.Uuid
+  serviceId     String?   @map("service_id") @db.Uuid
+  addressId     String?   @map("address_id") @db.Uuid
+  frequencyDays Int       @map("frequency_days") // 7=semanal, 14=quinzenal, 30=mensal
+  preferredTime String    @map("preferred_time") @db.VarChar(5) // "HH:MM"
+  isActive      Boolean   @default(true) @map("is_active")
+  nextOccurrence DateTime @map("next_occurrence")
+  pausedUntil   DateTime? @map("paused_until")
+  createdAt     DateTime  @default(now()) @map("created_at")
+  updatedAt     DateTime  @updatedAt @map("updated_at")
+
+  bookings Booking[]
+
+  @@index([clientId, isActive])
+  @@index([nextOccurrence, isActive])
+  @@map("recurring_bookings")
+}
+
+// =============================================================================
+// DOMÍNIO 6 — PAYMENTS & FINANCE
+// =============================================================================
+
+model Payment {
+  id               String        @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  bookingId        String        @unique @map("booking_id") @db.Uuid
+  method           PaymentMethod
+  status           PaymentStatus @default(PENDING)
+  amountCents      Int           @map("amount_cents")
+  gatewayId        String?       @map("gateway_id") @db.VarChar(255)
+  gateway          String?       @db.VarChar(50) // "asaas", "pagseguro"
+  pixCode          String?       @map("pix_code") @db.Text
+  pixExpiresAt     DateTime?     @map("pix_expires_at")
+  idempotencyKey   String        @unique @map("idempotency_key") @db.VarChar(255)
+  paidAt           DateTime?     @map("paid_at")
+  refundedAt       DateTime?     @map("refunded_at")
+  failureReason    String?       @map("failure_reason") @db.Text
+  metadata         Json?
+  createdAt        DateTime      @default(now()) @map("created_at")
+  updatedAt        DateTime      @updatedAt @map("updated_at")
+
+  booking    Booking     @relation(fields: [bookingId], references: [id])
+  commission Commission?
+
+  @@index([status, paidAt(sort: Desc)])
+  @@map("payments")
+}
+
+model Commission {
+  id               String   @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  bookingId        String   @unique @map("booking_id") @db.Uuid
+  paymentId        String?  @unique @map("payment_id") @db.Uuid
+  providerId       String   @map("provider_id") @db.Uuid
+  grossAmountCents Int      @map("gross_amount_cents")
+  commissionRate   Decimal  @map("commission_rate") @db.Decimal(5, 4)
+  commissionCents  Int      @map("commission_cents")
+  netAmountCents   Int      @map("net_amount_cents")
+  paidOutAt        DateTime? @map("paid_out_at")
+  createdAt        DateTime @default(now()) @map("created_at")
+
+  booking  Booking  @relation(fields: [bookingId], references: [id])
+  payment  Payment? @relation(fields: [paymentId], references: [id])
+  payout   Payout?  @relation(fields: [payoutId], references: [id])
+  payoutId String?  @map("payout_id") @db.Uuid
+
+  @@index([providerId, paidOutAt])
+  @@map("commissions")
+}
+
+model Payout {
+  id            String      @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  providerId    String      @map("provider_id") @db.Uuid
+  amountCents   Int         @map("amount_cents")
+  status        PayoutStatus @default(PENDING)
+  gatewayId     String?     @map("gateway_id") @db.VarChar(255)
+  processedAt   DateTime?   @map("processed_at")
+  failureReason String?     @map("failure_reason") @db.Text
+  createdAt     DateTime    @default(now()) @map("created_at")
+
+  commissions Commission[]
+
+  @@index([providerId, status])
+  @@map("payouts")
+}
+
+model Wallet {
+  id           String   @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  userId       String   @unique @map("user_id") @db.Uuid
+  balanceCents Int      @default(0) @map("balance_cents")
+  updatedAt    DateTime @updatedAt @map("updated_at")
+
+  user         User                @relation(fields: [userId], references: [id], onDelete: Cascade)
+  transactions WalletTransaction[]
+
+  @@map("wallets")
+}
+
+model WalletTransaction {
+  id           String   @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  walletId     String   @map("wallet_id") @db.Uuid
+  amountCents  Int      @map("amount_cents") // positivo = crédito, negativo = débito
+  balanceAfter Int      @map("balance_after_cents")
+  description  String   @db.VarChar(255)
+  referenceId  String?  @map("reference_id") @db.Uuid
+  referenceType String? @map("reference_type") @db.VarChar(50)
+  createdAt    DateTime @default(now()) @map("created_at")
+
+  wallet Wallet @relation(fields: [walletId], references: [id], onDelete: Cascade)
+
+  @@index([walletId, createdAt(sort: Desc)])
+  @@map("wallet_transactions")
+}
+
+// =============================================================================
+// DOMÍNIO 7 — REVIEWS & RATINGS
+// =============================================================================
+
+model Review {
+  id          String       @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  bookingId   String       @unique @map("booking_id") @db.Uuid
+  reviewerId  String       @map("reviewer_id") @db.Uuid
+  reviewedId  String       @map("reviewed_id") @db.Uuid
+  rating      Int          // 1-5
+  comment     String?      @db.Text
+  status      ReviewStatus @default(PENDING)
+  isAnonymous Boolean      @default(false) @map("is_anonymous")
+  publishedAt DateTime?    @map("published_at")
+  createdAt   DateTime     @default(now()) @map("created_at")
+
+  booking  Booking         @relation(fields: [bookingId], references: [id])
+  reviewer User            @relation("ReviewsGiven", fields: [reviewerId], references: [id])
+  reviewed User            @relation("ReviewsReceived", fields: [reviewedId], references: [id])
+  response ReviewResponse?
+
+  @@index([reviewedId, status, createdAt(sort: Desc)])
+  @@map("reviews")
+}
+
+model ReviewResponse {
+  id        String   @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  reviewId  String   @unique @map("review_id") @db.Uuid
+  authorId  String   @map("author_id") @db.Uuid
+  content   String   @db.Text
+  createdAt DateTime @default(now()) @map("created_at")
+
+  review Review @relation(fields: [reviewId], references: [id], onDelete: Cascade)
+
+  @@map("review_responses")
+}
+
+// =============================================================================
+// DOMÍNIO 8 — SEARCH & MATCHING
+// =============================================================================
+
+model SearchLog {
+  id           String   @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  clientId     String?  @map("client_id") @db.Uuid
+  categoryId   String?  @map("category_id") @db.Uuid
+  latitude     Decimal  @db.Decimal(10, 7)
+  longitude    Decimal  @db.Decimal(10, 7)
+  scheduledAt  DateTime? @map("scheduled_at")
+  resultsCount Int      @map("results_count")
+  latencyMs    Int?     @map("latency_ms")
+  modelVersion String?  @map("model_version") @db.VarChar(20)
+  createdAt    DateTime @default(now()) @map("created_at")
+
+  client      User?                @relation(fields: [clientId], references: [id], onDelete: SetNull)
+  impressions ProviderImpression[]
+
+  @@index([clientId, createdAt(sort: Desc)])
+  @@index([createdAt(sort: Desc)])
+  @@map("search_logs")
+}
+
+model ProviderImpression {
+  id               String   @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  searchId         String   @map("search_id") @db.Uuid
+  providerId       String   @map("provider_id") @db.Uuid
+  position         Int
+  score            Decimal  @db.Decimal(10, 8)
+  featuresSnapshot Json?    @map("features_snapshot")
+  wasClicked       Boolean  @default(false) @map("was_clicked")
+  wasBooked        Boolean  @default(false) @map("was_booked")
+  clickedAt        DateTime? @map("clicked_at")
+  bookedAt         DateTime? @map("booked_at")
+  createdAt        DateTime @default(now()) @map("created_at")
+
+  search SearchLog @relation(fields: [searchId], references: [id], onDelete: Cascade)
+
+  @@index([searchId])
+  @@index([providerId, createdAt(sort: Desc)])
+  @@map("provider_impressions")
+}
+
+// =============================================================================
+// DOMÍNIO 9 — NOTIFICATIONS
+// =============================================================================
+
+model Notification {
+  id          String              @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  userId      String              @map("user_id") @db.Uuid
+  channel     NotificationChannel
+  title       String              @db.VarChar(255)
+  body        String              @db.Text
+  data        Json?
+  referenceId String?             @map("reference_id") @db.Uuid
+  referenceType String?           @map("reference_type") @db.VarChar(50)
+  readAt      DateTime?           @map("read_at")
+  sentAt      DateTime?           @map("sent_at")
+  failedAt    DateTime?           @map("failed_at")
+  failReason  String?             @map("fail_reason") @db.Text
+  createdAt   DateTime            @default(now()) @map("created_at")
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([userId, readAt, createdAt(sort: Desc)])
+  @@map("notifications")
+}
+
+// =============================================================================
+// DOMÍNIO 11 — TRUST & SAFETY
+// =============================================================================
+
+model TrustScore {
+  id               String    @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  userId           String    @unique @map("user_id") @db.Uuid
+  score            Decimal   @db.Decimal(5, 2)
+  identityScore    Decimal   @map("identity_score") @db.Decimal(5, 2)
+  reputationScore  Decimal   @map("reputation_score") @db.Decimal(5, 2)
+  behaviorScore    Decimal   @map("behavior_score") @db.Decimal(5, 2)
+  seniorityScore   Decimal   @map("seniority_score") @db.Decimal(5, 2)
+  computedAt       DateTime  @map("computed_at")
+  updatedAt        DateTime  @updatedAt @map("updated_at")
+
+  user            User             @relation(fields: [userId], references: [id], onDelete: Cascade)
+  providerProfile ProviderProfile? @relation("ProviderTrustScore", fields: [userId], references: [userId])
+  history         TrustScoreHistory[]
+
+  @@map("trust_scores")
+}
+
+model TrustScoreHistory {
+  id           String   @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  trustScoreId String   @map("trust_score_id") @db.Uuid
+  score        Decimal  @db.Decimal(5, 2)
+  reason       String?  @db.VarChar(255)
+  createdAt    DateTime @default(now()) @map("created_at")
+
+  trustScore TrustScore @relation(fields: [trustScoreId], references: [id], onDelete: Cascade)
+
+  @@index([trustScoreId, createdAt(sort: Desc)])
+  @@map("trust_score_history")
+}
+
+model Dispute {
+  id          String        @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  bookingId   String        @unique @map("booking_id") @db.Uuid
+  openedById  String        @map("opened_by_id") @db.Uuid
+  reason      String        @db.Text
+  status      DisputeStatus @default(OPEN)
+  resolution  String?       @db.Text
+  resolvedAt  DateTime?     @map("resolved_at")
+  resolvedBy  String?       @map("resolved_by") @db.Uuid
+  createdAt   DateTime      @default(now()) @map("created_at")
+  updatedAt   DateTime      @updatedAt @map("updated_at")
+
+  booking Booking @relation(fields: [bookingId], references: [id])
+
+  @@index([status, createdAt])
+  @@map("disputes")
+}
+
+// =============================================================================
+// DOMÍNIO 15 — ANALYTICS & EVENTS
+// =============================================================================
+
+model AnalyticsEvent {
+  id          String   @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  userId      String?  @map("user_id") @db.Uuid
+  sessionId   String?  @map("session_id") @db.VarChar(100)
+  eventName   String   @map("event_name") @db.VarChar(100)
+  properties  Json?
+  ipAddress   String?  @map("ip_address") @db.VarChar(45)
+  userAgent   String?  @map("user_agent")
+  createdAt   DateTime @default(now()) @map("created_at")
+
+  @@index([eventName, createdAt(sort: Desc)])
+  @@index([userId, createdAt(sort: Desc)])
+  @@map("analytics_events")
+}
+
+// =============================================================================
+// DOMÍNIO 19 — PLATFORM CONFIG
+// =============================================================================
+
+model SystemConfig {
+  id          String   @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  key         String   @unique @db.VarChar(100)
+  value       String   @db.Text
+  description String?  @db.Text
+  updatedAt   DateTime @updatedAt @map("updated_at")
+
+  @@map("system_configs")
+}
+
+model FeatureFlag {
+  id          String   @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  key         String   @unique @db.VarChar(100)
+  isEnabled   Boolean  @default(false) @map("is_enabled")
+  rolloutPct  Int      @default(0) @map("rollout_pct") // 0-100
+  description String?  @db.Text
+  updatedAt   DateTime @updatedAt @map("updated_at")
+
+  @@map("feature_flags")
+}
