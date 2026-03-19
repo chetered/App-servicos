@@ -12,18 +12,24 @@ export default function Home() {
           Marketplace inteligente de serviços domésticos e profissionais
         </p>
 
-        <div className="grid grid-cols-1 gap-4 sm:grid-cols-2">
+        <div className="grid grid-cols-1 gap-4 sm:grid-cols-3">
           <Link
-            href="/dashboard"
+            href="/login"
             className="rounded-xl bg-primary-600 px-6 py-4 text-white font-semibold hover:bg-primary-700 transition-colors"
           >
-            Dashboard Admin
+            Entrar
+          </Link>
+          <Link
+            href="/dashboard"
+            className="rounded-xl border-2 border-primary-600 px-6 py-4 text-primary-600 font-semibold hover:bg-primary-50 transition-colors"
+          >
+            Dashboard
           </Link>
           <Link
             href="/api/docs"
-            className="rounded-xl border-2 border-primary-600 px-6 py-4 text-primary-600 font-semibold hover:bg-primary-50 transition-colors"
+            className="rounded-xl border-2 border-gray-200 px-6 py-4 text-gray-600 font-semibold hover:bg-gray-50 transition-colors"
           >
-            API Docs (Swagger)
+            API Docs
           </Link>
         </div>
 
