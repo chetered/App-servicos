@@ -58,3 +58,4 @@ ios/
 
 # Expo
 .expo-shared/
+apps/web/tsconfig.tsbuildinfo
