@@ -1,6 +1,6 @@
 // =============================================================================
 // PRISMA SCHEMA — MARKETPLACE DE SERVIÇOS
-// PostgreSQL 16 + PostGIS | 124 modelos | 20 domínios
+// PostgreSQL 16 | 124 modelos | 20 domínios
 // Ref: docs/schema/BLOCO_B_SCHEMA_PRISMA.md
 // =============================================================================
 
@@ -13,7 +13,7 @@ generator client {
 datasource db {
   provider   = "postgresql"
   url        = env("DATABASE_URL")
-  extensions = [uuidOssp(map: "uuid-ossp"), postgis, pgTrgm(map: "pg_trgm"), unaccent]
+  extensions = [uuidOssp(map: "uuid-ossp"), pgTrgm(map: "pg_trgm"), unaccent]
 }
 
 // =============================================================================
