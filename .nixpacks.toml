@@ -9,6 +9,3 @@ cmds = [
   "pnpm --filter @servicos/database exec prisma generate",
   "pnpm --filter @servicos/api run build"
 ]
-
-[start]
-cmd = "node_modules/.bin/prisma db push --schema=packages/database/prisma/schema.prisma --skip-generate && node apps/api/dist/apps/api/src/main.js"
