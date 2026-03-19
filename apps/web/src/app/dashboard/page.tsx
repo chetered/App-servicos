@@ -1,8 +1,5 @@
 'use client';
 
-import { useQuery } from '@tanstack/react-query';
-import { formatBRL } from '@servicos/utils';
-
 interface StatsCard {
   title: string;
   value: string;
