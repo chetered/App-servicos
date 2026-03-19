@@ -11,4 +11,4 @@ cmds = [
 ]
 
 [start]
-cmd = "npx prisma migrate deploy --schema=packages/database/prisma/schema.prisma && node apps/api/dist/apps/api/src/main.js"
+cmd = "node_modules/.bin/prisma db push --schema=packages/database/prisma/schema.prisma --skip-generate && node apps/api/dist/apps/api/src/main.js"
