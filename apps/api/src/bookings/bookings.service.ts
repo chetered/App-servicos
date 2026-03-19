@@ -127,7 +127,7 @@ export class BookingsService {
         status: dto.status as Parameters<typeof this.prisma.booking.update>[0]['data']['status'],
         ...(dto.status === 'COMPLETED' ? { completedAt: now } : {}),
         ...(dto.status.startsWith('CANCELLED') ? { cancelledAt: now, cancelReason: dto.cancelReason } : {}),
-        timeline: { create: { status: dto.status as Parameters<typeof this.prisma.booking.update>[0]['data']['status'], actorId: userId, note: dto.cancelReason } },
+        timeline: { create: { status: dto.status as never, actorId: userId, note: dto.cancelReason } },
       },
       include: BOOKING_INCLUDE,
     });

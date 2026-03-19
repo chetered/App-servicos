@@ -1,4 +1,4 @@
-import { Injectable, NotFoundException, ForbiddenException, BadRequestException, ConflictException } from '@nestjs/common';
+import { Injectable, NotFoundException, ForbiddenException, ConflictException } from '@nestjs/common';
 import { PrismaService } from '../prisma/prisma.service';
 import { CreateReviewDto, RespondReviewDto } from './dto/reviews.dto';
 
@@ -9,6 +9,7 @@ export class ReviewsService {
   async create(userId: string, dto: CreateReviewDto) {
     const booking = await this.prisma.booking.findFirst({
       where: { id: dto.bookingId, clientId: userId, status: 'COMPLETED', deletedAt: null },
+      include: { provider: true },
     });
     if (!booking) throw new NotFoundException('Agendamento não encontrado ou não concluído');
 
@@ -19,17 +20,18 @@ export class ReviewsService {
       const rev = await tx.review.create({
         data: {
           bookingId: dto.bookingId,
-          clientId: userId,
-          providerId: booking.providerId,
+          reviewerId: userId,
+          reviewedId: booking.provider.userId,
           rating: dto.rating,
           comment: dto.comment,
+          status: 'PUBLISHED',
+          publishedAt: new Date(),
         },
-        include: { client: { include: { profile: true } } },
       });
 
       // Recalculate provider average rating
       const stats = await tx.review.aggregate({
-        where: { providerId: booking.providerId, deletedAt: null },
+        where: { reviewedId: booking.provider.userId, status: 'PUBLISHED' },
         _avg: { rating: true },
         _count: { rating: true },
       });
@@ -37,7 +39,7 @@ export class ReviewsService {
       await tx.providerProfile.update({
         where: { id: booking.providerId },
         data: {
-          avgRating: stats._avg.rating ?? 0,
+          overallRating: stats._avg.rating ?? 0,
           totalReviews: stats._count.rating,
         },
       });
@@ -50,27 +52,27 @@ export class ReviewsService {
 
   async respond(reviewId: string, userId: string, dto: RespondReviewDto) {
     const review = await this.prisma.review.findFirst({
-      where: { id: reviewId, deletedAt: null },
-      include: { provider: true },
+      where: { id: reviewId },
+      include: { reviewed: true, response: true },
     });
     if (!review) throw new NotFoundException('Avaliação não encontrada');
-    if (review.provider.userId !== userId) throw new ForbiddenException('Apenas o prestador pode responder');
-    if (review.reviewResponse) throw new ConflictException('Resposta já enviada');
+    if (review.reviewed.id !== userId) throw new ForbiddenException('Apenas o prestador pode responder');
+    if (review.response) throw new ConflictException('Resposta já enviada');
 
     return this.prisma.reviewResponse.create({
-      data: { reviewId, response: dto.response },
+      data: { reviewId, authorId: userId, content: dto.response },
     });
   }
 
-  async findByProvider(providerId: string, page = 1, perPage = 20) {
+  async findByProvider(providerUserId: string, page = 1, perPage = 20) {
     const skip = (page - 1) * perPage;
     const [total, items] = await Promise.all([
-      this.prisma.review.count({ where: { providerId, deletedAt: null } }),
+      this.prisma.review.count({ where: { reviewedId: providerUserId, status: 'PUBLISHED' } }),
       this.prisma.review.findMany({
-        where: { providerId, deletedAt: null },
+        where: { reviewedId: providerUserId, status: 'PUBLISHED' },
         include: {
-          client: { include: { profile: { select: { displayName: true, avatarUrl: true } } } },
-          reviewResponse: true,
+          reviewer: { include: { profile: { select: { displayName: true, avatarUrl: true } } } },
+          response: true,
         },
         orderBy: { createdAt: 'desc' },
         skip,

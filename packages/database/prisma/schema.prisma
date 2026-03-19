@@ -806,8 +806,8 @@ model TrustScore {
   computedAt       DateTime  @map("computed_at")
   updatedAt        DateTime  @updatedAt @map("updated_at")
 
-  user            User             @relation(fields: [userId], references: [id], onDelete: Cascade)
-  providerProfile ProviderProfile? @relation("ProviderTrustScore", fields: [userId], references: [userId])
+  user            User             @relation(fields: [userId], references: [id], onDelete: Cascade, map: "trust_scores_user_fkey")
+  providerProfile ProviderProfile? @relation("ProviderTrustScore", fields: [userId], references: [userId], map: "trust_scores_provider_fkey")
   history         TrustScoreHistory[]
 
   @@map("trust_scores")

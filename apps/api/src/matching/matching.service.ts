@@ -75,8 +75,7 @@ export class MatchingService implements OnModuleInit {
     }
 
     const [categoryAvgPrice, prevProviders] = await Promise.all([
-      this.cache.getCategoryAvgPrice(ctx.categoryId) ??
-        this.computeAndCacheAvgPrice(ctx.categoryId),
+      this.cache.getCategoryAvgPrice(ctx.categoryId).then((v) => v ?? this.computeAndCacheAvgPrice(ctx.categoryId)),
       this.cache.getClientPreviousProviders(ctx.clientId),
     ]);
 

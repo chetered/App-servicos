@@ -41,18 +41,18 @@ export class PaymentsService {
 
     try {
       const asaasPayload = this.buildAsaasPayload(booking, payment, dto);
-      const { data: asaasResponse } = await firstValueFrom(
-        this.http.post(`${this.asaasBaseUrl}/payments`, asaasPayload, {
+      const asaasResponse = await firstValueFrom(
+        this.http.post<{ id: string; pixQrCode?: { payload: string } }>(`${this.asaasBaseUrl}/payments`, asaasPayload, {
           headers: { access_token: this.asaasApiKey },
         }),
-      );
+      ).then((r) => r.data);
 
       await this.prisma.payment.update({
         where: { id: payment.id },
         data: {
           gatewayId: asaasResponse.id,
           status: dto.method === 'PIX' ? 'PENDING' : 'AUTHORIZED',
-          pixQrCode: asaasResponse.pixQrCode?.payload,
+          pixCode: asaasResponse.pixQrCode?.payload,
           pixExpiresAt: asaasResponse.pixQrCode ? new Date(Date.now() + 30 * 60 * 1000) : null,
         },
       });
@@ -66,7 +66,7 @@ export class PaymentsService {
         },
       });
 
-      return { paymentId: payment.id, method: dto.method, pixQrCode: asaasResponse.pixQrCode?.payload };
+      return { paymentId: payment.id, method: dto.method, pixCode: asaasResponse.pixQrCode?.payload };
     } catch (err) {
       await this.prisma.payment.update({ where: { id: payment.id }, data: { status: 'FAILED' } });
       this.logger.error('Asaas payment error', err);

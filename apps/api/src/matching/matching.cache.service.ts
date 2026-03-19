@@ -15,14 +15,13 @@ export class MatchingCacheService implements OnModuleInit {
     bookingDistribution: 300,
   };
 
-  constructor(private readonly config: ConfigService) {}
-
-  onModuleInit() {
-    this.redis = new Redis(this.config.get<string>('REDIS_URL', 'redis://localhost:6379'), {
-      lazyConnect: true,
-    });
-    this.redis.on('error', (e) => this.logger.error('Redis error', e));
+  constructor(private readonly config: ConfigService) {
+    const redisUrl = config.get<string>('REDIS_URL', 'redis://localhost:6379');
+    this.redis = new Redis(redisUrl, { lazyConnect: false, enableReadyCheck: false, maxRetriesPerRequest: null });
+    this.redis.on('error', (e) => this.logger.warn(`Redis error: ${e.message}`));
   }
+
+  onModuleInit() { /* Redis initialized in constructor */ }
 
   async getCategoryAvgPrice(categoryId: string): Promise<number | null> {
     const val = await this.redis.get(`matching:price:cat:${categoryId}`);

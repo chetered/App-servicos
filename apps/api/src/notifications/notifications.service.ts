@@ -30,10 +30,11 @@ export class NotificationsService {
       await this.prisma.notification.create({
         data: {
           userId: opts.userId,
-          type: opts.type as never,
+          channel: 'IN_APP',
           title: opts.title,
           body: opts.body,
-          data: opts.data ?? {},
+          data: opts.data ? JSON.parse(JSON.stringify(opts.data)) : undefined,
+          sentAt: new Date(),
         },
       });
     }

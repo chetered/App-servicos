@@ -18,7 +18,7 @@ export class MatchingController {
   async search(
     @Query() dto: SearchProvidersQueryDto,
     @CurrentUser('id') clientId: string,
-  ) {
+  ): Promise<{ providers: unknown[]; meta: { total: number; searchId: string | null; latencyMs: number } }> {
     const startMs = Date.now();
     const providers = await this.matchingService.search({
       clientId,

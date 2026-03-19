@@ -1,2 +1,25 @@
-// Re-export do pacote compartilhado para uso no NestJS via DI
-export { PrismaService } from '@servicos/database/src/prisma.service';
+import { Injectable, Logger, OnModuleInit, OnModuleDestroy } from '@nestjs/common';
+import { PrismaClient } from '@servicos/database/generated/client';
+
+@Injectable()
+export class PrismaService extends PrismaClient implements OnModuleInit, OnModuleDestroy {
+  private readonly logger = new Logger(PrismaService.name);
+
+  constructor() {
+    super({
+      log:
+        process.env['NODE_ENV'] === 'development'
+          ? [{ emit: 'event', level: 'query' }, 'warn', 'error']
+          : ['warn', 'error'],
+    });
+  }
+
+  async onModuleInit(): Promise<void> {
+    await this.$connect();
+    this.logger.log('Database connected');
+  }
+
+  async onModuleDestroy(): Promise<void> {
+    await this.$disconnect();
+  }
+}

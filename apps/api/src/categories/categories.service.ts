@@ -7,20 +7,20 @@ export class CategoriesService {
 
   async findAll() {
     return this.prisma.category.findMany({
-      where: { isActive: true, deletedAt: null },
+      where: { isActive: true },
       orderBy: { sortOrder: 'asc' },
       include: {
-        _count: { select: { providerCategories: { where: { provider: { verificationStatus: 'APPROVED', isAvailable: true } } } } },
+        _count: { select: { providers: true } },
       },
     });
   }
 
   async findOne(id: string) {
     const category = await this.prisma.category.findFirst({
-      where: { id, isActive: true, deletedAt: null },
+      where: { id, isActive: true },
       include: {
-        services: { where: { isActive: true }, orderBy: { name: 'asc' } },
-        _count: { select: { providerCategories: true } },
+        services: { orderBy: { name: 'asc' } },
+        _count: { select: { providers: true } },
       },
     });
     if (!category) throw new NotFoundException('Categoria não encontrada');

@@ -2,14 +2,18 @@
   "extends": "../../tsconfig.base.json",
   "compilerOptions": {
     "outDir": "./dist",
-    "rootDir": "./src",
     "baseUrl": ".",
+    "noUnusedLocals": false,
+    "noUnusedParameters": false,
+    "noImplicitOverride": false,
+    "strictPropertyInitialization": false,
     "paths": {
       "@servicos/database": ["../../packages/database/src"],
+      "@servicos/database/generated/client": ["../../packages/database/generated/client"],
       "@servicos/types": ["../../packages/types/src"],
       "@servicos/utils": ["../../packages/utils/src"]
     }
   },
-  "include": ["src/**/*"],
+  "include": ["src/**/*", "../../packages/database/src/**/*", "../../packages/types/src/**/*", "../../packages/utils/src/**/*"],
   "exclude": ["node_modules", "dist", "**/*.spec.ts"]
 }
