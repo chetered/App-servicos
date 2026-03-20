@@ -24,7 +24,7 @@ export default function LoginPage() {
     setError('');
     try {
       const { data } = await api.post('/v1/auth/login', { email, password });
-      setTokens(data.data.accessToken, data.data.refreshToken);
+      setTokens(data.accessToken, data.refreshToken);
       const me = await api.get('/v1/auth/me');
       setUser(me.data);
       router.push('/dashboard');
@@ -65,7 +65,7 @@ export default function LoginPage() {
         code: otpCode,
         purpose: 'LOGIN',
       });
-      setTokens(data.data.accessToken, data.data.refreshToken);
+      setTokens(data.accessToken, data.refreshToken);
       const me = await api.get('/v1/auth/me');
       setUser(me.data);
       router.push('/dashboard');

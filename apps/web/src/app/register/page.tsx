@@ -29,7 +29,7 @@ export default function RegisterPage() {
     setError('');
     try {
       const { data } = await api.post('/v1/auth/register', formData);
-      setTokens(data.data.accessToken, data.data.refreshToken);
+      setTokens(data.accessToken, data.refreshToken);
       const me = await api.get('/v1/auth/me');
       setUser(me.data);
       router.push('/dashboard');
