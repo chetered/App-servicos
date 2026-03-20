@@ -29,4 +29,8 @@ export class PaginationQueryDto {
   @ApiPropertyOptional({ default: 20 })
   @IsOptional() @IsNumber() @Min(1) @Type(() => Number)
   perPage?: number;
+
+  @ApiPropertyOptional()
+  @IsOptional() @IsString()
+  status?: string;
 }
