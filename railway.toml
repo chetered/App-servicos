@@ -1,0 +1,8 @@
+# Railway monorepo configuration
+# startCommand is configured per-service in the Railway dashboard
+[build]
+builder = "NIXPACKS"
+
+[deploy]
+restartPolicyType = "ON_FAILURE"
+restartPolicyMaxRetries = 3
