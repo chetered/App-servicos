@@ -73,12 +73,16 @@ export class BookingsService {
     const perPage = Math.min(query.perPage ?? 20, 50);
     const skip = (page - 1) * perPage;
 
+    const where = {
+      OR: [{ clientId: userId }, { provider: { userId } }],
+      deletedAt: null,
+      ...(query.status ? { status: query.status } : {}),
+    };
+
     const [total, items] = await Promise.all([
-      this.prisma.booking.count({
-        where: { OR: [{ clientId: userId }, { provider: { userId } }], deletedAt: null },
-      }),
+      this.prisma.booking.count({ where }),
       this.prisma.booking.findMany({
-        where: { OR: [{ clientId: userId }, { provider: { userId } }], deletedAt: null },
+        where,
         include: BOOKING_INCLUDE,
         orderBy: { scheduledAt: 'desc' },
         skip,
