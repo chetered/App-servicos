@@ -21,7 +21,10 @@ if (typeof window !== 'undefined') {
         try {
           const refreshToken = localStorage.getItem('refresh_token');
           if (!refreshToken) throw new Error('No refresh token');
-          const { data } = await axios.post('/v1/auth/refresh', { refreshToken });
+          const { data } = await axios.post(
+            `${process.env.NEXT_PUBLIC_API_URL ?? 'http://localhost:3001'}/v1/auth/refresh`,
+            { refreshToken },
+          );
           localStorage.setItem('access_token', data.accessToken);
           localStorage.setItem('refresh_token', data.refreshToken);
           err.config.headers.Authorization = `Bearer ${data.accessToken}`;
