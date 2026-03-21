@@ -76,7 +76,7 @@ export class BookingsService {
     const where = {
       OR: [{ clientId: userId }, { provider: { userId } }],
       deletedAt: null,
-      ...(query.status ? { status: query.status } : {}),
+      ...(query.status ? { status: query.status as never } : {}),
     };
 
     const [total, items] = await Promise.all([
